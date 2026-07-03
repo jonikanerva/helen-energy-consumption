@@ -1,0 +1,39 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Helen Energy Consumption",
+        "description": "Sign in with your Oma Helen credentials. Only electricity consumption is imported.",
+        "data": {
+          "username": "Username",
+          "password": "Password",
+          "custom_name": "Name (optional)"
+        }
+      },
+      "select_site": {
+        "title": "Select delivery site",
+        "description": "Your account has more than one meter. Choose which delivery site to import.",
+        "data": {
+          "delivery_site_id": "Delivery site (GSRN)"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate Helen",
+        "description": "Your Helen session expired. Enter your password again.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid username or password.",
+      "cannot_connect": "Could not connect to Helen. Try again later.",
+      "invalid_delivery_site_id": "That delivery site could not be selected."
+    },
+    "abort": {
+      "already_configured": "This account is already configured.",
+      "reauth_successful": "Re-authentication was successful.",
+      "reauth_failed": "Re-authentication failed."
+    }
+  }
+}
