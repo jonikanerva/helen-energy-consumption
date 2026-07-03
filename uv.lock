@@ -1091,9 +1091,9 @@ dev = [
 dev = [
     { name = "homeassistant", specifier = ">=2025.1,<2025.2" },
     { name = "oma-helen-cli", specifier = "==1.8.0" },
-    { name = "pytest" },
-    { name = "pytest-homeassistant-custom-component" },
-    { name = "ruff" },
+    { name = "pytest", specifier = ">=8.3,<9" },
+    { name = "pytest-homeassistant-custom-component", specifier = ">=0.13.205,<0.14" },
+    { name = "ruff", specifier = "==0.15.20" },
 ]
 
 [[package]]
