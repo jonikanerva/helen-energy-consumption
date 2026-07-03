@@ -1,0 +1,7 @@
+{
+  "name": "Helen Energy Consumption",
+  "content_in_root": false,
+  "country": "FI",
+  "homeassistant": "2025.1.0",
+  "render_readme": true
+}
