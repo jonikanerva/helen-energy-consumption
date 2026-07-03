@@ -208,7 +208,14 @@ class HelenConsumptionStatistics:
         # repair cascades its positive delta forward through the DB, including
         # last_db_hour, so anchor the forward walk on the repaired total to
         # avoid dropping energy at the boundary.
-        repaired_delta = await self._repair_zero_filled_hours(api_entries, existing)
+        repairs = await self._repair_zero_filled_hours(api_entries, existing)
+        repaired_delta = sum(delta for _, delta in repairs)
+
+        # Flat-fill fully-absent interior hours (gaps strictly between present
+        # rows). These carry post-repair sums (see _fill_missing_interior_hours)
+        # and sit below last_db_hour with zero delta, so they never touch the
+        # anchor; their real data lands on the next poll's repair pass.
+        missing_rows = self._fill_missing_interior_hours(existing, repairs)
 
         if existing:
             last_db_hour = max(existing.keys())
@@ -218,44 +225,47 @@ class HelenConsumptionStatistics:
             cumulative = 0.0
             walk_start = earliest_api
 
+        stats: list[StatisticData] = []
+        zero_filled = 0
         if walk_start > latest_real_hour:
             _LOGGER.debug(
-                "Up to date: DB at %s, latest real API hour %s",
+                "Chain tail up to date: DB at %s, latest real API hour %s",
                 walk_start.isoformat(),
                 latest_real_hour.isoformat(),
             )
-            return
+        else:
+            current_hour = walk_start
+            while current_hour <= latest_real_hour:
+                entry = api_entries.get(current_hour)
+                electricity = entry.electricity if entry else None
+                if electricity is None:
+                    # No data yet — hold the cumulative sum flat. The repair
+                    # pass upgrades this hour once real data arrives.
+                    electricity = 0.0
+                    zero_filled += 1
 
-        stats: list[StatisticData] = []
-        zero_filled = 0
-        current_hour = walk_start
-        while current_hour <= latest_real_hour:
-            entry = api_entries.get(current_hour)
-            electricity = entry.electricity if entry else None
-            if electricity is None:
-                # No data yet — hold the cumulative sum flat. The repair pass
-                # upgrades this hour once real data arrives.
-                electricity = 0.0
-                zero_filled += 1
-
-            cumulative += electricity
-            stats.append(
-                StatisticData(
-                    start=current_hour,
-                    state=_safe_round(cumulative),
-                    sum=_safe_round(cumulative),
+                cumulative += electricity
+                stats.append(
+                    StatisticData(
+                        start=current_hour,
+                        state=_safe_round(cumulative),
+                        sum=_safe_round(cumulative),
+                    )
                 )
-            )
-            current_hour += timedelta(hours=1)
+                current_hour += timedelta(hours=1)
 
-        if not stats:
+        # missing_rows (< last_db_hour) and stats (>= last_db_hour + 1h) are
+        # disjoint and each ascending, so the concatenation is already ordered.
+        combined = missing_rows + stats
+        if not combined:
             return
 
-        await self._import_statistics(stats)
+        await self._import_statistics(combined)
         _LOGGER.info(
-            "Wrote %d hour(s) for %s (zero_filled=%d)",
-            len(stats),
+            "Wrote %d hour(s) for %s (interior_gap=%d, zero_filled=%d)",
+            len(combined),
             self.consumption_statistic_id,
+            len(missing_rows),
             zero_filled,
         )
 
@@ -263,22 +273,24 @@ class HelenConsumptionStatistics:
         self,
         api_entries: dict[datetime, MeasurementsWithSpotPriceSeries],
         existing: dict[datetime, float],
-    ) -> float:
+    ) -> list[tuple[datetime, float]]:
         """Upgrade previously zero-filled hours that now have real API data.
 
         A zero-filled hour leaves the cumulative sum unchanged from the previous
         hour. When real data later arrives, apply the delta via
         async_adjust_statistics so HA cascades it to all later records. Returns
-        the total repaired delta, which the caller adds to the anchor so the
-        forward walk starts from the post-repair cumulative value.
+        the (hour, delta) adjustments applied this poll; the caller derives the
+        total to anchor the forward walk and computes post-repair sums for
+        interior gap-fill from these deltas in memory (a DB re-read cannot be
+        trusted — adjustments are queued on the recorder thread and may not be
+        flushed before a read runs).
         """
         sorted_hours = sorted(existing.keys())
         if len(sorted_hours) < 2:
-            return 0.0
+            return []
 
         recorder = get_instance(self.hass)
-        repaired = 0
-        repaired_delta = 0.0
+        repairs: list[tuple[datetime, float]] = []
         for prev_hour, curr_hour in zip(sorted_hours, sorted_hours[1:], strict=False):
             if curr_hour != prev_hour + timedelta(hours=1):
                 continue
@@ -292,22 +304,63 @@ class HelenConsumptionStatistics:
             recorder.async_adjust_statistics(
                 self.consumption_statistic_id, curr_hour, entry.electricity, "kWh"
             )
-            repaired += 1
-            repaired_delta += entry.electricity
+            repairs.append((curr_hour, entry.electricity))
             _LOGGER.debug(
                 "Repaired zero-filled hour %s: +%.3f kWh",
                 curr_hour.isoformat(),
                 entry.electricity,
             )
 
-        if repaired:
+        if repairs:
             _LOGGER.info(
                 "Repaired %d zero-filled hour(s) for %s",
-                repaired,
+                len(repairs),
                 self.consumption_statistic_id,
             )
 
-        return repaired_delta
+        return repairs
+
+    def _fill_missing_interior_hours(
+        self,
+        existing: dict[datetime, float],
+        repairs: list[tuple[datetime, float]],
+    ) -> list[StatisticData]:
+        """Insert flat rows for fully-absent interior hours in the window.
+
+        For each consecutive present pair with a gap, every absent hour strictly
+        between them gets a flat row carrying the post-repair cumulative sum at
+        ``prev_hour``. That sum is computed in memory as ``existing[prev_hour]``
+        plus every repair delta applied at an hour <= ``prev_hour`` — the same
+        value the cascading adjustments leave in the DB — so the chain stays
+        monotonic without a re-read racing the queued adjustments. Existing rows
+        are never modified; the real data for these hours is applied on the next
+        poll by the adjacent-pair repair path.
+        """
+        sorted_hours = sorted(existing.keys())
+        if len(sorted_hours) < 2:
+            return []
+
+        rows: list[StatisticData] = []
+        for prev_hour, curr_hour in zip(sorted_hours, sorted_hours[1:], strict=False):
+            if curr_hour <= prev_hour + timedelta(hours=1):
+                continue  # adjacent — no interior gap
+
+            flat_sum = _safe_round(
+                existing[prev_hour]
+                + sum(delta for hour, delta in repairs if hour <= prev_hour)
+            )
+            gap_hour = prev_hour + timedelta(hours=1)
+            while gap_hour < curr_hour:
+                rows.append(StatisticData(start=gap_hour, state=flat_sum, sum=flat_sum))
+                gap_hour += timedelta(hours=1)
+
+        if rows:
+            _LOGGER.debug(
+                "Filling %d missing interior hour(s) for %s",
+                len(rows),
+                self.consumption_statistic_id,
+            )
+        return rows
 
     async def _get_existing_statistics_in_window(
         self, statistic_id: str, start_time: datetime, end_time: datetime
