@@ -26,16 +26,19 @@ annotations` in every module. Full static-type enforcement mode is **user-owned*
 
 ## Build & verify commands
 
-- Setup: `uv sync`
+- Setup: `mise install` — installs the pinned tools (Python 3.12, uv) and runs
+  `uv sync` via a postinstall hook, bringing the whole dev environment up in one
+  command. Plain `uv sync` also works once the tools are present.
 - **`$VERIFY_CMD`** (the single gate every change must pass):
   `uv run ruff check custom_components && uv run pytest tests/`
 - Lint only: `uv run ruff check custom_components`
 - Tests only: `uv run pytest tests/ -v`
 - HA integration validation (run before release): `hassfest`
 
-> The test/lint harness (`pyproject.toml`, `tests/`, ruff config) is not yet
-> scaffolded — set it up before relying on `$VERIFY_CMD` in CI or the
-> project-manager flow.
+> The test/lint harness lives in `pyproject.toml` (dev dependency group, ruff and
+> pytest config) and `tests/`. Home Assistant is pinned to the 2025.1 series via
+> the dev group; the resolver allows pre-releases (`tool.uv.prerelease`) because
+> HA depends on beta packages. `uv.lock` is committed for reproducible installs.
 
 ## Performance budgets
 

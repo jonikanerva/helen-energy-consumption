@@ -1,0 +1,11 @@
+# Development environment for the Helen Energy Consumption HACS component.
+# `mise install` installs the pinned tools and then runs `uv sync` (postinstall
+# hook), so a single command brings the whole dev environment up.
+
+[tools]
+python = "3.12"
+uv = "latest"
+
+[hooks]
+# Runs after tools are installed; does not require `mise activate`.
+postinstall = "uv sync"
