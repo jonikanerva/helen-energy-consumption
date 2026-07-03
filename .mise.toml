@@ -9,3 +9,11 @@ uv = "latest"
 [hooks]
 # Runs after tools are installed; does not require `mise activate`.
 postinstall = "uv sync"
+
+[tasks.verify]
+description = "Full lint + format + test gate (run before opening a PR)"
+run = [
+    "uv run ruff check custom_components tests",
+    "uv run ruff format --check custom_components tests",
+    "uv run pytest tests/",
+]

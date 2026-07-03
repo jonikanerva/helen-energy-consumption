@@ -29,9 +29,14 @@ annotations` in every module. Full static-type enforcement mode is **user-owned*
 - Setup: `mise install` — installs the pinned tools (Python 3.12, uv) and runs
   `uv sync` via a postinstall hook, bringing the whole dev environment up in one
   command. Plain `uv sync` also works once the tools are present.
-- **`$VERIFY_CMD`** (the single gate every change must pass):
-  `uv run ruff check custom_components && uv run pytest tests/`
-- Lint only: `uv run ruff check custom_components`
+- **`$VERIFY_CMD`** (the single gate every change must pass, and the gate for
+  opening a PR): `mise run verify` — composes, failing on the first error:
+  `uv run ruff check custom_components tests`,
+  `uv run ruff format --check custom_components tests`, and
+  `uv run pytest tests/`.
+- Lint only: `uv run ruff check custom_components tests`
+- Format check only: `uv run ruff format --check custom_components tests`
+- Format fix: `uv run ruff format custom_components tests`
 - Tests only: `uv run pytest tests/ -v`
 - HA integration validation (run before release): `hassfest`
 
