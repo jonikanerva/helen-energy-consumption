@@ -34,7 +34,7 @@ class HelenConsumptionCoordinator:
         hass: HomeAssistant,
         entry: ConfigEntry,
         credentials: dict[str, str],
-        delivery_site_id: str | None,
+        delivery_site_id: str,
     ) -> None:
         """Initialize the coordinator and its statistics manager."""
         self.hass = hass
@@ -48,7 +48,7 @@ class HelenConsumptionCoordinator:
         self.statistics = HelenConsumptionStatistics(
             hass,
             self.api_client,
-            entry.entry_id,
+            delivery_site_id,
             entry.title,
         )
 

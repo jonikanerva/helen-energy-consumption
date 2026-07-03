@@ -6,15 +6,14 @@
         "description": "Sign in with your Oma Helen credentials. Only electricity consumption is imported.",
         "data": {
           "username": "Username",
-          "password": "Password",
-          "custom_name": "Name (optional)"
+          "password": "Password"
         }
       },
       "select_site": {
         "title": "Select delivery site",
-        "description": "Your account has more than one meter. Choose which delivery site to import.",
+        "description": "Your account has more than one delivery site. Choose which one to import; each option shows its meter number (GSRN) and address.",
         "data": {
-          "delivery_site_id": "Delivery site (GSRN)"
+          "delivery_site_id": "Delivery site"
         }
       },
       "reauth_confirm": {
@@ -32,6 +31,7 @@
     },
     "abort": {
       "already_configured": "This account is already configured.",
+      "no_delivery_sites": "This Helen account has no electricity delivery site to import.",
       "reauth_successful": "Re-authentication was successful.",
       "reauth_failed": "Re-authentication failed."
     }

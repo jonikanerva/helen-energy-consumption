@@ -33,7 +33,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "username": entry.data[CONF_USERNAME],
             "password": entry.data[CONF_PASSWORD],
         },
-        delivery_site_id=entry.data.get(CONF_DELIVERY_SITE_ID),
+        delivery_site_id=entry.data[CONF_DELIVERY_SITE_ID],
     )
 
     # Run one import immediately so the Energy Dashboard has data right away.

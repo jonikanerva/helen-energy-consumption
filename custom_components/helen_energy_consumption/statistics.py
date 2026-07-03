@@ -9,6 +9,7 @@ scope — this integration only imports consumption.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -48,6 +49,16 @@ class StatisticsQueryError(Exception):
     """
 
 
+def build_statistic_id(delivery_site_id: str) -> str:
+    """Build the external statistic_id for a Helen delivery-site id.
+
+    External statistic object ids allow only lowercase letters, digits and
+    underscores, so any other character in the delivery-site id is replaced.
+    """
+    object_id = re.sub(r"[^a-z0-9_]", "_", str(delivery_site_id).lower())
+    return f"{DOMAIN}:consumption_{object_id}"
+
+
 def _safe_round(value: float | None, decimals: int = 3) -> float:
     """Round a value, returning 0.0 if it is None or non-numeric."""
     if value is None:
@@ -65,7 +76,7 @@ class HelenConsumptionStatistics:
         self,
         hass: HomeAssistant,
         api_client: HelenApiClient,
-        config_entry_id: str,
+        delivery_site_id: str,
         name: str,
     ) -> None:
         """Initialize the statistics manager.
@@ -73,16 +84,14 @@ class HelenConsumptionStatistics:
         Args:
             hass: Home Assistant instance.
             api_client: Authenticated Helen API client.
-            config_entry_id: Config entry ID, used to build a unique statistic_id.
+            delivery_site_id: Helen delivery-site id the statistic is keyed on.
             name: Human-readable name for the statistic (shown in the dashboard).
         """
         self.hass = hass
         self.api_client = api_client
         self.name = name
 
-        # statistic_ids only allow lowercase, digits and underscores.
-        suffix = config_entry_id.replace("-", "").lower()[:8]
-        self.consumption_statistic_id = f"{DOMAIN}:hourly_energy_consumption_{suffix}"
+        self.consumption_statistic_id = build_statistic_id(delivery_site_id)
 
         _LOGGER.debug(
             "Initialized consumption statistics for %s (%d hour window)",
