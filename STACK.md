@@ -59,8 +59,13 @@ annotations` in every module. Full static-type enforcement mode is **user-owned*
   `statistic_id = helen_energy_consumption:hourly_energy_consumption_<8-char suffix>`,
   unit `kWh`, `has_sum = True`, cumulative `state`/`sum`.
 - The cumulative chain is anchored to the last DB record in the query window;
-  gaps are zero-filled and later repaired via `async_adjust_statistics`. Never
-  rewrite history outside the current rolling window.
+  gaps are zero-filled and later repaired via `async_adjust_statistics`. The
+  automatic poll never rewrites history outside the current rolling window.
+- **Backfill action:** an explicit, user-triggered action (Developer Tools →
+  Actions) may rebuild a bounded historical range (from a start date to now) for
+  a chosen config entry, writing statistics outside the rolling window. It must
+  stay within the API's available history (bounded by the contract start date)
+  and must never corrupt or erase existing statistics on a transient failure.
 
 ## Approved dependencies
 
@@ -77,8 +82,10 @@ annotations` in every module. Full static-type enforcement mode is **user-owned*
 - ❌ Re-implementing Helen authentication or endpoint parsing — belongs in
   `oma-helen-cli`; push fixes upstream.
 - ❌ Cost/price/spot/VAT/contract-type logic — out of scope per `VISION.md`.
-- ❌ Writing statistics outside the current rolling window, or any code path
-  that can erase/corrupt already-imported history on a transient failure.
+- ❌ Writing statistics outside the current rolling window on the automatic poll
+  path — **except** via the explicit, user-triggered backfill action, which may
+  rebuild a bounded historical range. In every path (poll or backfill), a
+  transient failure must never erase or corrupt already-imported history.
 - ❌ Adding entities, services, or Lovelace resources without a `VISION.md`
   decision-filter pass.
 - ❌ Unpinned or floating dependency versions in `manifest.json`.

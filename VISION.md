@@ -35,6 +35,8 @@ Dashboard consumes directly. Correct, low-maintenance, and boring.
 - Config flow: Oma Helen credentials, optional delivery-site pick when the
   account has several meters.
 - A background poll (default every 3 h) that extends the statistics chain.
+- A technical backfill action (Home Assistant Developer Tools → Actions) that
+  imports or repairs a bounded historical range for a chosen delivery site.
 - Output: one external statistic per config entry, `kWh`, `has_sum`, ready for
   the Energy Dashboard.
 
@@ -45,7 +47,10 @@ Dashboard consumes directly. Correct, low-maintenance, and boring.
   `oma-helen-ha-integration`'s job.)
 - **No dashboards, cards, or Lovelace resources** shipped with the integration.
 - **No production/return-to-grid or gas** unless Helen exposes it and users ask.
-- **No manual backfill UI/service** in v1 — the rolling window is the mechanism.
+- **No end-user backfill UI.** A _technical_ backfill action (Developer Tools →
+  Actions) is provided to import history on onboarding and to repair corrupted
+  ranges; there is no consumer-facing backfill UI, and the automatic rolling
+  window remains the normal mechanism.
 - **No config for the poll interval** unless a real need appears.
 
 ## Decision Filter
