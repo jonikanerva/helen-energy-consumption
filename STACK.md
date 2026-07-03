@@ -80,7 +80,13 @@ annotations` in every module. Full static-type enforcement mode is **user-owned*
 - `oma-helen-cli` (pinned) — Helen API access.
 - Anything already shipped with Home Assistant core (voluptuous, aiohttp, the
   recorder, helpers).
-- Dev-only: `pytest`, `pytest-homeassistant-custom-component`, `ruff`.
+- Dev-only, version-bounded for reproducibility: `pytest>=8.3,<9`,
+  `pytest-homeassistant-custom-component>=0.13.205,<0.14` (aligned to the HA
+  2025.1 series), and `ruff==0.15.20` (exact-pinned because it defines the
+  lint + format gate and its output can shift between releases). `uv` is pinned
+  in `.mise.toml`, and `mise install` runs `uv sync --frozen`, so every dev
+  environment resolves from the authoritative committed `uv.lock`. Bumping
+  `ruff` or `uv` is a deliberate manual step.
 - **Adding any other runtime dependency requires explicit approval** and a note
   here. Default answer is no — prefer stdlib or HA core helpers.
 

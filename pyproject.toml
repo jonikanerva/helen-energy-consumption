@@ -24,9 +24,9 @@ prerelease = "allow"
 [dependency-groups]
 dev = [
     "homeassistant>=2025.1,<2025.2",
-    "pytest-homeassistant-custom-component",
-    "pytest",
-    "ruff",
+    "pytest-homeassistant-custom-component>=0.13.205,<0.14",
+    "pytest>=8.3,<9",
+    "ruff==0.15.20",
     "oma-helen-cli==1.8.0",
 ]
 

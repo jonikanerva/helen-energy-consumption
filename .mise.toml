@@ -4,11 +4,12 @@
 
 [tools]
 python = "3.12"
-uv = "latest"
+uv = "0.11.26"
 
 [hooks]
 # Runs after tools are installed; does not require `mise activate`.
-postinstall = "uv sync"
+# --frozen installs exactly from the committed uv.lock (reproducible).
+postinstall = "uv sync --frozen"
 
 [tasks.verify]
 description = "Full lint + format + test gate (run before opening a PR)"
