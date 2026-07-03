@@ -15,12 +15,13 @@ query so the chain arithmetic is exercised without a live HA database.
 from __future__ import annotations
 
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
+from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.helen_energy_consumption.statistics import (
     HelenConsumptionStatistics,
@@ -314,3 +315,197 @@ async def test_convert_naive_dst_fallback_collapses_via_fold_zero() -> None:
     await manager._ensure_helsinki_tz()
     result = manager._convert_to_utc("2025-10-26T03:30:00")
     assert result == datetime(2025, 10, 26, 0, 30, tzinfo=_UTC)
+
+
+# --- rebuild_range (backfill action, issue #10) -----------------------------
+
+
+def _ser(hour: datetime, electricity: float | None) -> SimpleNamespace:
+    """Build a fake Helen series entry at an absolute UTC hour."""
+    return SimpleNamespace(start=hour.isoformat(), electricity=electricity)
+
+
+async def _start_utc(manager: HelenConsumptionStatistics, start_date: date) -> datetime:
+    """Compute start_utc the way rebuild_range does (Helsinki 00:00 -> UTC)."""
+    await manager._ensure_helsinki_tz()
+    return manager._convert_to_utc(
+        datetime.combine(start_date, datetime.min.time()).isoformat()
+    ).replace(minute=0, second=0, microsecond=0)
+
+
+async def _run_rebuild(
+    manager: HelenConsumptionStatistics,
+    start_date: date,
+    series: list[SimpleNamespace],
+    in_range: dict[datetime, float],
+    anchor_rows: dict[datetime, float],
+    now_hour: datetime,
+) -> list | None:
+    """Drive rebuild_range with fully mocked fetch/reads; return the write batch."""
+    captured: dict[str, list] = {}
+
+    async def _capture(rows: list) -> None:
+        captured["rows"] = rows
+
+    manager._import_statistics = _capture
+    manager._fetch_range_data = AsyncMock(return_value=series)
+
+    async def _read(stat_id: str, start: datetime, end: datetime | None) -> dict:
+        # end=None -> the in-range tail read; otherwise the strict pre-start read.
+        return dict(in_range) if end is None else dict(anchor_rows)
+
+    manager._get_existing_statistics_in_window = _read
+
+    with patch(f"{_STATS_MODULE}.dt_util.utcnow", return_value=now_hour):
+        await manager.rebuild_range(start_date)
+    return captured.get("rows")
+
+
+async def test_rebuild_continuous_at_both_boundaries() -> None:
+    """A clean rebuild anchors on the prior sum and stays contiguous/monotonic."""
+    manager = _manager()
+    start_date = date(2026, 1, 15)
+    s0 = await _start_utc(manager, start_date)
+
+    def h(i: int) -> datetime:
+        return s0 + timedelta(hours=i)
+
+    series = [_ser(h(i), e) for i, e in enumerate([1.0, 2.0, 3.0, 4.0, 5.0])]
+    anchor_rows = {h(-1): 10.0}  # pre-anchor sum before start
+
+    rows = await _run_rebuild(manager, start_date, series, {}, anchor_rows, h(4))
+
+    assert rows is not None
+    starts = [r["start"] for r in rows]
+    sums = [r["sum"] for r in rows]
+    assert all(st >= s0 for st in starts)  # nothing before start_utc
+    assert starts == [h(i) for i in range(5)]  # contiguous
+    assert sums[0] == pytest.approx(11.0)  # 10 anchor + elec0
+    assert sums == sorted(sums)  # monotonic
+    assert sums[-1] == pytest.approx(25.0)
+
+
+async def test_rebuild_onboarding_starts_from_zero() -> None:
+    """With no prior data the anchor is 0.0 and the first row is elec0."""
+    manager = _manager()
+    start_date = date(2026, 1, 15)
+    s0 = await _start_utc(manager, start_date)
+
+    def h(i: int) -> datetime:
+        return s0 + timedelta(hours=i)
+
+    series = [_ser(h(i), e) for i, e in enumerate([1.5, 2.0, 0.5])]
+
+    rows = await _run_rebuild(manager, start_date, series, {}, {}, h(2))
+
+    assert rows is not None
+    assert rows[0]["sum"] == pytest.approx(1.5)
+    assert rows[-1]["sum"] == pytest.approx(4.0)
+
+
+async def test_rebuild_first_hour_predecessor_is_anchor() -> None:
+    """GUARD #1: h0's predecessor is the anchor, not an absent in_range[h0-1]."""
+    manager = _manager()
+    start_date = date(2026, 1, 15)
+    s0 = await _start_utc(manager, start_date)
+
+    def h(i: int) -> datetime:
+        return s0 + timedelta(hours=i)
+
+    # API has no data for h0; the DB already holds a real h0 (sum 12 = anchor 10
+    # + delta 2). Using the anchor as predecessor preserves it as 12; a naive
+    # in_range[h0-1] lookup (absent -> 0) would double it to 22.
+    series = [_ser(h(1), 3.0), _ser(h(2), 4.0)]
+    in_range = {h(0): 12.0}
+    anchor_rows = {h(-1): 10.0}
+
+    rows = await _run_rebuild(manager, start_date, series, in_range, anchor_rows, h(2))
+
+    assert rows is not None
+    by_start = {r["start"]: r["sum"] for r in rows}
+    assert by_start[h(0)] == pytest.approx(12.0)  # preserved via anchor predecessor
+    assert by_start[h(1)] == pytest.approx(15.0)  # 12 + 3
+    assert by_start[h(2)] == pytest.approx(19.0)  # 15 + 4
+
+
+async def test_rebuild_preserves_real_history_with_missing_predecessor_gaps() -> None:
+    """Partial API response preserves the existing real tail across gaps.
+
+    API returns h0-h4 (matching the existing sums); h5-h10 come back None.
+    The existing DB tail has gaps at h7 and h9. Each preserved hour measures its
+    delta against the RUNNING cumulative, so the chain snaps back onto the
+    existing sums (h10 unchanged) even across the absent predecessors — a naive
+    in_range[h-1] lookup would double-count at h8 and h10.
+    """
+    manager = _manager()
+    start_date = date(2026, 1, 15)
+    s0 = await _start_utc(manager, start_date)
+
+    def h(i: int) -> datetime:
+        return s0 + timedelta(hours=i)
+
+    series = [_ser(h(i), 1.0) for i in range(5)]  # h0-h4 real; cumulative -> 5
+    series += [_ser(h(i), None) for i in range(5, 11)]  # h5-h10 no API data
+    in_range = {
+        h(0): 1.0,
+        h(1): 2.0,
+        h(2): 3.0,
+        h(3): 4.0,
+        h(4): 5.0,
+        h(5): 6.0,
+        h(6): 7.0,
+        h(8): 9.0,
+        h(10): 11.0,  # h7, h9 absent (gaps)
+    }
+
+    rows = await _run_rebuild(manager, start_date, series, in_range, {}, h(10))
+
+    assert rows is not None
+    by_start = {r["start"]: r["sum"] for r in rows}
+    assert by_start[h(5)] == pytest.approx(6.0)
+    assert by_start[h(6)] == pytest.approx(7.0)
+    assert by_start[h(7)] == pytest.approx(7.0)  # gap: flat-held
+    assert by_start[h(8)] == pytest.approx(9.0)  # snaps back despite h7 absent
+    assert by_start[h(9)] == pytest.approx(9.0)  # gap: flat-held
+    assert by_start[h(10)] == pytest.approx(11.0)  # tail unchanged
+    sums = [r["sum"] for r in rows]
+    assert sums == sorted(sums)  # monotonic
+
+
+async def test_rebuild_fetch_failure_writes_nothing() -> None:
+    """A transient fetch failure raises before the write; nothing is imported."""
+    manager = _manager()
+    manager._import_statistics = AsyncMock()
+    manager._fetch_range_data = AsyncMock(side_effect=RuntimeError("Helen down"))
+
+    with pytest.raises(RuntimeError):
+        await manager.rebuild_range(date(2026, 1, 15))
+
+    manager._import_statistics.assert_not_called()
+
+
+async def test_rebuild_empty_response_writes_nothing() -> None:
+    """An empty API response raises and imports nothing (fail-closed).
+
+    Reads and utcnow are mocked/bounded so that without the empty-response guard
+    the code would reach the (bounded) write — this asserts it does not.
+    """
+    manager = _manager()
+    start_date = date(2026, 1, 15)
+    s0 = await _start_utc(manager, start_date)
+
+    manager._import_statistics = AsyncMock()
+    manager._fetch_range_data = AsyncMock(return_value=[])
+
+    async def _read(stat_id: str, start: datetime, end: datetime | None) -> dict:
+        return {}
+
+    manager._get_existing_statistics_in_window = _read
+
+    with (
+        patch(f"{_STATS_MODULE}.dt_util.utcnow", return_value=s0 + timedelta(hours=2)),
+        pytest.raises(HomeAssistantError),
+    ):
+        await manager.rebuild_range(start_date)
+
+    manager._import_statistics.assert_not_called()
