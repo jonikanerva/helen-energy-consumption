@@ -14,6 +14,7 @@ query so the chain arithmetic is exercised without a live HA database.
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -122,3 +123,61 @@ async def test_repaired_delta_keeps_chain_continuous_at_boundary() -> None:
     # Post-repair boundary is 2.5; appending +0.3 must yield 2.8 (no lost delta).
     assert stats[0]["sum"] == pytest.approx(2.8)
     assert stats[0]["state"] == pytest.approx(2.8)
+
+
+# --- _convert_to_utc (input edge, issue #3) ---------------------------------
+
+
+def test_convert_aware_helsinki_winter_to_utc() -> None:
+    """An offset-aware winter (EET, +02:00) timestamp converts to UTC."""
+    result = _manager()._convert_to_utc("2026-01-15T10:00:00+02:00")
+    assert result == datetime(2026, 1, 15, 8, 0, tzinfo=_UTC)
+
+
+def test_convert_aware_helsinki_summer_to_utc() -> None:
+    """An offset-aware summer (EEST, +03:00) timestamp converts to UTC."""
+    result = _manager()._convert_to_utc("2026-07-15T10:00:00+03:00")
+    assert result == datetime(2026, 7, 15, 7, 0, tzinfo=_UTC)
+
+
+async def test_convert_naive_localizes_to_helsinki_not_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A naive timestamp is localized to Helsinki regardless of the host tz.
+
+    This is the core regression: with a host tz of America/New_York, a buggy
+    astimezone-on-naive would yield 15:00Z; localizing to Helsinki gives 08:00Z.
+    """
+    manager = _manager()
+    await manager._ensure_helsinki_tz()
+
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        result = manager._convert_to_utc("2026-01-15T10:00:00")
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+    assert result == datetime(2026, 1, 15, 8, 0, tzinfo=_UTC)
+
+
+def test_convert_dst_fallback_aware_buckets_are_distinct() -> None:
+    """The two offsets of the DST fall-back hour map to distinct UTC hours."""
+    before = _manager()._convert_to_utc("2025-10-26T03:00:00+03:00")
+    after = _manager()._convert_to_utc("2025-10-26T03:00:00+02:00")
+    assert before == datetime(2025, 10, 26, 0, 0, tzinfo=_UTC)
+    assert after == datetime(2025, 10, 26, 1, 0, tzinfo=_UTC)
+    assert before != after
+
+
+async def test_convert_naive_dst_fallback_collapses_via_fold_zero() -> None:
+    """A naive fall-back local hour collapses to its first (fold=0) offset.
+
+    Documents the unrecoverable ambiguity noted in _convert_to_utc: without an
+    offset the duplicated Helsinki local hour resolves to EEST (+03:00).
+    """
+    manager = _manager()
+    await manager._ensure_helsinki_tz()
+    result = manager._convert_to_utc("2025-10-26T03:30:00")
+    assert result == datetime(2025, 10, 26, 0, 30, tzinfo=_UTC)

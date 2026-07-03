@@ -35,6 +35,7 @@ from homeassistant.components.recorder.statistics import (
 )
 from homeassistant.const import UnitOfEnergy
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, STATISTICS_BACKFILL_HOURS
 
@@ -90,6 +91,9 @@ class HelenConsumptionStatistics:
         self.hass = hass
         self.api_client = api_client
         self.name = name
+        # Resolved once off the event loop; only the naive-timestamp input edge
+        # needs it (see _ensure_helsinki_tz / _convert_to_utc).
+        self._helsinki_tz: ZoneInfo | None = None
 
         self.consumption_statistic_id = build_statistic_id(delivery_site_id)
 
@@ -168,6 +172,10 @@ class HelenConsumptionStatistics:
             _LOGGER.debug("No interval data to process")
             return
 
+        # Resolve the Helsinki zone off the loop before the (sync) conversion
+        # loop, so _convert_to_utc never blocks on tzdata I/O.
+        await self._ensure_helsinki_tz()
+
         api_entries: dict[datetime, MeasurementsWithSpotPriceSeries] = {}
         for entry in series:
             hour = self._convert_to_utc(entry.start).replace(
@@ -186,9 +194,7 @@ class HelenConsumptionStatistics:
             return
         latest_real_hour = max(real_hours)
 
-        now_utc = datetime.now(ZoneInfo("UTC")).replace(
-            minute=0, second=0, microsecond=0
-        )
+        now_utc = dt_util.utcnow().replace(minute=0, second=0, microsecond=0)
         window_end = now_utc + timedelta(hours=1)
         try:
             existing = await self._get_existing_statistics_in_window(
@@ -338,19 +344,39 @@ class HelenConsumptionStatistics:
             raw = stat["start"]
             if isinstance(raw, datetime):
                 ts = (
-                    raw.replace(tzinfo=ZoneInfo("UTC"))
+                    raw.replace(tzinfo=dt_util.UTC)
                     if raw.tzinfo is None
-                    else raw.astimezone(ZoneInfo("UTC"))
+                    else raw.astimezone(dt_util.UTC)
                 )
             else:
-                ts = datetime.fromtimestamp(raw, tz=ZoneInfo("UTC"))
+                ts = dt_util.utc_from_timestamp(raw)
             ts = ts.replace(minute=0, second=0, microsecond=0)
             existing[ts] = stat.get("sum", 0.0)
         return existing
 
-    def _convert_to_utc(self, helsinki_timestamp: str) -> datetime:
-        """Convert an ISO 8601 (Helsinki) timestamp string to UTC."""
-        return datetime.fromisoformat(helsinki_timestamp).astimezone(ZoneInfo("UTC"))
+    async def _ensure_helsinki_tz(self) -> None:
+        """Resolve the Europe/Helsinki zone once, off the event loop.
+
+        Resolving a ZoneInfo does blocking tzdata filesystem I/O on first use,
+        so it must never run on the loop; dt_util.async_get_time_zone does it in
+        the executor. Only naive Helen timestamps consume this zone.
+        """
+        if self._helsinki_tz is None:
+            self._helsinki_tz = await dt_util.async_get_time_zone("Europe/Helsinki")
+
+    def _convert_to_utc(self, timestamp: str) -> datetime:
+        """Convert a Helen ISO 8601 timestamp string to UTC.
+
+        Helen normally returns offset-aware timestamps; a naive value is
+        localized to Europe/Helsinki (never the host tz) before converting.
+        """
+        parsed = dt_util.parse_datetime(timestamp, raise_on_error=True)
+        if parsed.tzinfo is None:
+            # Naive input: localize to Helsinki. A DST fall-back duplicated
+            # local hour collapses via fold=0 and is unrecoverable without an
+            # offset — only relevant if Helen ever emits naive timestamps.
+            parsed = parsed.replace(tzinfo=self._helsinki_tz)
+        return parsed.astimezone(dt_util.UTC)
 
     async def _import_statistics(self, statistics: list[StatisticData]) -> None:
         """Write the cumulative consumption stream into the HA database."""
