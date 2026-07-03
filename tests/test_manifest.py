@@ -10,9 +10,7 @@ import json
 from pathlib import Path
 
 _COMPONENT = (
-    Path(__file__).parent.parent
-    / "custom_components"
-    / "helen_energy_consumption"
+    Path(__file__).parent.parent / "custom_components" / "helen_energy_consumption"
 )
 
 
