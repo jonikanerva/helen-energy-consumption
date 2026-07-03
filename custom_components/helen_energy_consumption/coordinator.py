@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import date
 from typing import TYPE_CHECKING
 
 from helenservice.api_client import HelenApiClient
@@ -16,7 +17,7 @@ from helenservice.api_exceptions import (
     HelenAuthenticationException,
     InvalidApiResponseException,
 )
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryAuthFailed, ServiceValidationError
 
 from .statistics import HelenConsumptionStatistics
 
@@ -94,6 +95,46 @@ class HelenConsumptionCoordinator:
                     raise
             finally:
                 self.api_client.close()
+
+    async def async_backfill(self, start_date: date) -> None:
+        """Rebuild this delivery site's chain for [start_date, now] from Helen.
+
+        A user-initiated repair/import action: it WAITS for the poll lock
+        (reusing #7's lock) so it runs to completion and never interleaves with
+        a scheduled poll. Validates the requested range against the contract
+        start before rebuilding. All Helen calls run in the executor; any
+        failure raises before the single statistics write, leaving prior data
+        intact (VISION principle 5).
+        """
+        async with self._update_lock:
+            try:
+                await self._login_if_needed()
+                await self.hass.async_add_executor_job(
+                    self.api_client.select_delivery_site_if_valid_id,
+                    self.delivery_site_id,
+                )
+                await self._validate_backfill_range(start_date)
+                await self.statistics.rebuild_range(start_date)
+            finally:
+                self.api_client.close()
+
+    async def _validate_backfill_range(self, start_date: date) -> None:
+        """Reject a start_date in the future or before available history.
+
+        A missing contract start (None) is treated as an unknowable bound and
+        allowed through, so the rebuild proceeds best-effort.
+        """
+        if start_date > date.today():
+            raise ServiceValidationError(f"start_date {start_date} is in the future")
+
+        contract_start = await self.hass.async_add_executor_job(
+            self.api_client.get_contract_start_date
+        )
+        if contract_start is not None and start_date < contract_start:
+            raise ServiceValidationError(
+                f"start_date {start_date} is before earliest available data "
+                f"({contract_start})"
+            )
 
     async def _login_if_needed(self) -> None:
         """Ensure the API client has a valid session."""

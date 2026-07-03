@@ -9,6 +9,11 @@ DOMAIN: Final = "helen_energy_consumption"
 
 CONF_DELIVERY_SITE_ID: Final = "delivery_site_id"
 
+# The backfill admin action (Developer Tools -> Actions) and its fields.
+SERVICE_BACKFILL: Final = "backfill"
+ATTR_START_DATE: Final = "start_date"
+ATTR_CONFIG_ENTRY_ID: Final = "config_entry_id"
+
 # How often the integration re-fetches hourly consumption from Helen.
 SCAN_INTERVAL: Final = timedelta(hours=3)
 

@@ -8,20 +8,85 @@ Energy Dashboard. No entities, no cost tracking — consumption only.
 from __future__ import annotations
 
 import logging
+from datetime import date
 from typing import TYPE_CHECKING
 
+import homeassistant.helpers.config_validation as cv
+import voluptuous as vol
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryNotReady,
+    ServiceValidationError,
+)
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.service import async_register_admin_service
 
-from .const import CONF_DELIVERY_SITE_ID, SCAN_INTERVAL
+from .const import (
+    ATTR_CONFIG_ENTRY_ID,
+    ATTR_START_DATE,
+    CONF_DELIVERY_SITE_ID,
+    DOMAIN,
+    SCAN_INTERVAL,
+    SERVICE_BACKFILL,
+)
 from .coordinator import HelenConsumptionCoordinator
 
 if TYPE_CHECKING:
-    from homeassistant.config_entries import ConfigEntry
-    from homeassistant.core import HomeAssistant
+    from homeassistant.core import HomeAssistant, ServiceCall
 
 _LOGGER = logging.getLogger(__name__)
+
+_BACKFILL_SCHEMA = vol.Schema(
+    {
+        vol.Required(ATTR_START_DATE): cv.date,
+        vol.Optional(ATTR_CONFIG_ENTRY_ID): cv.string,
+    }
+)
+
+
+def _resolve_target_entry(hass: HomeAssistant, entry_id: str | None) -> ConfigEntry:
+    """Resolve the backfill target: the given entry, or the sole loaded one."""
+    if entry_id is not None:
+        entry = hass.config_entries.async_get_entry(entry_id)
+        if entry is None or entry.domain != DOMAIN:
+            raise ServiceValidationError(
+                f"{entry_id} is not a Helen Energy Consumption config entry"
+            )
+        if entry.state is not ConfigEntryState.LOADED:
+            raise ServiceValidationError(f"Config entry {entry_id} is not loaded")
+        return entry
+
+    loaded = [
+        entry
+        for entry in hass.config_entries.async_entries(DOMAIN)
+        if entry.state is ConfigEntryState.LOADED
+    ]
+    if not loaded:
+        raise ServiceValidationError(
+            "No loaded Helen Energy Consumption config entry to backfill"
+        )
+    if len(loaded) > 1:
+        raise ServiceValidationError(
+            "Multiple delivery sites are configured; specify config_entry_id"
+        )
+    return loaded[0]
+
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Register the backfill admin action once for the integration."""
+
+    async def _handle_backfill(call: ServiceCall) -> None:
+        """Rebuild a delivery site's chain from the requested start date."""
+        start_date: date = call.data[ATTR_START_DATE]
+        entry = _resolve_target_entry(hass, call.data.get(ATTR_CONFIG_ENTRY_ID))
+        await entry.runtime_data.async_backfill(start_date)
+
+    async_register_admin_service(
+        hass, DOMAIN, SERVICE_BACKFILL, _handle_backfill, schema=_BACKFILL_SCHEMA
+    )
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
