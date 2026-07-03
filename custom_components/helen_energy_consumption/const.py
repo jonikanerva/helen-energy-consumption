@@ -8,7 +8,6 @@ from typing import Final
 DOMAIN: Final = "helen_energy_consumption"
 
 CONF_DELIVERY_SITE_ID: Final = "delivery_site_id"
-CONF_CUSTOM_NAME: Final = "custom_name"
 
 # How often the integration re-fetches hourly consumption from Helen.
 SCAN_INTERVAL: Final = timedelta(hours=3)
