@@ -37,9 +37,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     # Run one import immediately so the Energy Dashboard has data right away.
-    # A failure here (bad credentials, API down) surfaces as a retryable setup.
+    # raise_on_error=True makes a transient failure (API down) surface as
+    # ConfigEntryNotReady so HA retries with backoff; bad credentials surface as
+    # ConfigEntryAuthFailed so reauth starts.
     try:
-        await coordinator.async_update()
+        await coordinator.async_update(raise_on_error=True)
     except ConfigEntryAuthFailed:
         # Let HA start the reauth flow; do not mask it as a retryable setup.
         coordinator.close()

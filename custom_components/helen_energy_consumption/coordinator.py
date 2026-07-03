@@ -52,8 +52,15 @@ class HelenConsumptionCoordinator:
             entry.title,
         )
 
-    async def async_update(self) -> None:
-        """Log in if needed and import the latest consumption statistics."""
+    async def async_update(self, raise_on_error: bool = False) -> None:
+        """Log in if needed and import the latest consumption statistics.
+
+        The timer poll stays fail-quiet (``raise_on_error=False``) so a
+        transient failure never crashes the integration (VISION principle 5).
+        The initial setup import passes ``raise_on_error=True`` so transient
+        failures surface as ConfigEntryNotReady and HA retries with backoff.
+        ConfigEntryAuthFailed always propagates so reauth can start.
+        """
         try:
             await self._login_if_needed()
             if self.delivery_site_id is not None:
@@ -66,8 +73,12 @@ class HelenConsumptionCoordinator:
             raise ConfigEntryAuthFailed from err
         except InvalidApiResponseException as err:
             _LOGGER.warning("Helen API error during consumption import: %s", err)
+            if raise_on_error:
+                raise
         except Exception:
             _LOGGER.exception("Unexpected error during consumption import")
+            if raise_on_error:
+                raise
         finally:
             self.api_client.close()
 
