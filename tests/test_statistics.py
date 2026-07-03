@@ -125,6 +125,139 @@ async def test_repaired_delta_keeps_chain_continuous_at_boundary() -> None:
     assert stats[0]["state"] == pytest.approx(2.8)
 
 
+# --- mid-window interior gap repair (issue #6) ------------------------------
+
+
+async def _run_poll(
+    manager: HelenConsumptionStatistics,
+    series: list[SimpleNamespace],
+    existing: dict[datetime, float],
+    recorder: MagicMock | None = None,
+) -> tuple[list | None, MagicMock]:
+    """Run one _write_statistics_chain poll with a mocked existing snapshot.
+
+    Returns the captured import batch (or None if nothing was imported) and the
+    recorder mock used for repair adjustments.
+    """
+    manager._get_existing_statistics_in_window = AsyncMock(return_value=existing)
+    captured: dict[str, list] = {}
+
+    async def _capture(stats: list) -> None:
+        captured["stats"] = stats
+
+    manager._import_statistics = _capture
+    rec = recorder or MagicMock()
+    with patch(f"{_STATS_MODULE}.get_instance", return_value=rec):
+        await manager._write_statistics_chain(series)
+    return captured.get("stats"), rec
+
+
+async def test_missing_interior_hour_flat_filled_this_poll() -> None:
+    """A fully-absent interior hour is flat-filled now, not adjusted."""
+    manager = _manager()
+    # H2 is entirely absent between present H1 and H3; no zero-filled hours.
+    existing = {_hour(0): 1.0, _hour(1): 2.0, _hour(3): 2.0}
+
+    stats, recorder = await _run_poll(manager, [_entry(1, 1.0)], existing)
+
+    assert stats is not None
+    rows = {row["start"]: row["sum"] for row in stats}
+    assert rows == {_hour(2): pytest.approx(2.0)}
+    # Flat row holds the sum flat from the left neighbour -> chain stays monotonic.
+    assert existing[_hour(1)] <= rows[_hour(2)] <= existing[_hour(3)]
+    # The gap hour is not adjusted this poll (deferred to the next poll).
+    recorder.async_adjust_statistics.assert_not_called()
+
+
+async def test_missing_interior_hour_converges_next_poll() -> None:
+    """Next poll repairs the now-present flat hour and anchors on the delta."""
+    manager = _manager()
+    # H2 is now present as a flat row (2.0) from the previous poll; H4 is new.
+    existing = {_hour(1): 2.0, _hour(2): 2.0, _hour(3): 2.0}
+
+    stats, recorder = await _run_poll(
+        manager, [_entry(2, 0.6), _entry(4, 0.3)], existing
+    )
+
+    # Adjacent-pair repair applies the API delta to the once-missing hour.
+    recorder.async_adjust_statistics.assert_called_once_with(
+        manager.consumption_statistic_id, _hour(2), 0.6, "kWh"
+    )
+    # New tail hour anchors on existing[H3] + repaired_delta (2.0 + 0.6), so the
+    # appended H4 is 2.6 + 0.3 = 2.9 — the repaired energy is not lost.
+    assert stats is not None
+    rows = {row["start"]: row["sum"] for row in stats}
+    assert rows[_hour(4)] == pytest.approx(2.9)
+
+
+async def test_repair_before_gap_stays_monotonic_multi_repair() -> None:
+    """da's guard: repairs before a gap must lift the flat fill (no dip).
+
+    Two zero-filled hours (H1, H2) are repaired (+0.5, +0.7) before a
+    fully-absent gap at H3 whose present neighbours are H2 and H4. The repair
+    cascade leaves H2 at 1.0 + 0.5 + 0.7 = 2.2, so the flat H3 must be 2.2 too.
+    A naive pre-repair snapshot would fill H3 with 1.0 -> a permanent dip.
+    """
+    manager = _manager()
+    existing = {_hour(0): 1.0, _hour(1): 1.0, _hour(2): 1.0, _hour(4): 1.0}
+
+    stats, recorder = await _run_poll(
+        manager, [_entry(1, 0.5), _entry(2, 0.7)], existing
+    )
+
+    # Both zero-filled hours before the gap were repaired; the gap was not.
+    assert recorder.async_adjust_statistics.call_count == 2
+    adjusted_hours = {
+        c.args[1] for c in recorder.async_adjust_statistics.call_args_list
+    }
+    assert adjusted_hours == {_hour(1), _hour(2)}
+
+    assert stats is not None
+    rows = {row["start"]: row["sum"] for row in stats}
+    # Flat fill reflects ALL repair deltas applied at hours <= prev_hour (H2):
+    # 1.0 + 0.5 + 0.7 = 2.2, matching the post-cascade neighbours (no dip).
+    assert rows[_hour(3)] == pytest.approx(2.2)
+
+
+async def test_transient_read_failure_skips_gap_fill() -> None:
+    """A failed existing read writes nothing, even with an interior gap."""
+    manager = _manager()
+    manager._import_statistics = AsyncMock()
+
+    recorder = MagicMock()
+    recorder.async_add_executor_job = AsyncMock(side_effect=RuntimeError("db down"))
+
+    # Series that would otherwise trigger a gap fill / append.
+    series = [_entry(0, 1.0), _entry(3, 0.4)]
+    with patch(f"{_STATS_MODULE}.get_instance", return_value=recorder):
+        await manager._write_statistics_chain(series)
+
+    manager._import_statistics.assert_not_called()
+
+
+async def test_combined_batch_is_disjoint_and_ordered() -> None:
+    """missing_rows (< last_db_hour) and appended stats (>= +1h) are disjoint."""
+    manager = _manager()
+    # Gap at H1 (between H0 and H2); H3 is a new tail hour to append.
+    existing = {_hour(0): 1.0, _hour(2): 1.0}
+
+    stats, _ = await _run_poll(manager, [_entry(0, 1.0), _entry(3, 0.4)], existing)
+
+    assert stats is not None
+    starts = [row["start"] for row in stats]
+    last_db_hour = max(existing.keys())
+    missing = [h for h in starts if h < last_db_hour]
+    appended = [h for h in starts if h >= last_db_hour + timedelta(hours=1)]
+    assert missing == [_hour(1)]
+    assert appended == [_hour(3)]
+    assert set(missing).isdisjoint(appended)
+    # Concatenation is already globally ascending.
+    assert starts == sorted(starts)
+    rows = {row["start"]: row["sum"] for row in stats}
+    assert rows[_hour(1)] == pytest.approx(1.0)  # flat from H0
+    assert rows[_hour(3)] == pytest.approx(1.4)  # 1.0 anchor + 0.4
+
+
 # --- _convert_to_utc (input edge, issue #3) ---------------------------------
 
 
