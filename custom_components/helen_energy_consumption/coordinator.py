@@ -7,6 +7,7 @@ hourly consumption into the statistics database on a fixed interval.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
@@ -41,6 +42,9 @@ class HelenConsumptionCoordinator:
         self.entry = entry
         self.credentials = credentials
         self.delivery_site_id = delivery_site_id
+        # Created on the event loop (async_setup_entry runs __init__), so it is
+        # bound to the running loop. Guards against overlapping polls.
+        self._update_lock = asyncio.Lock()
 
         # Consumption is in kWh and does not depend on VAT or margin, so the
         # client is created without price parameters.
@@ -60,27 +64,36 @@ class HelenConsumptionCoordinator:
         The initial setup import passes ``raise_on_error=True`` so transient
         failures surface as ConfigEntryNotReady and HA retries with backoff.
         ConfigEntryAuthFailed always propagates so reauth can start.
+
+        A poll already in progress is skipped (not queued): the shared
+        api_client session must not be touched by two overlapping runs. The
+        locked() check and the acquire are kept adjacent with no await between
+        them so the test-and-acquire is atomic on the single event loop.
         """
-        try:
-            await self._login_if_needed()
-            if self.delivery_site_id is not None:
-                await self.hass.async_add_executor_job(
-                    self.api_client.select_delivery_site_if_valid_id,
-                    self.delivery_site_id,
-                )
-            await self.statistics.import_recent_statistics()
-        except HelenAuthenticationException as err:
-            raise ConfigEntryAuthFailed from err
-        except InvalidApiResponseException as err:
-            _LOGGER.warning("Helen API error during consumption import: %s", err)
-            if raise_on_error:
-                raise
-        except Exception:
-            _LOGGER.exception("Unexpected error during consumption import")
-            if raise_on_error:
-                raise
-        finally:
-            self.api_client.close()
+        if self._update_lock.locked():
+            _LOGGER.debug("Consumption poll already in progress; skipping this tick")
+            return
+        async with self._update_lock:
+            try:
+                await self._login_if_needed()
+                if self.delivery_site_id is not None:
+                    await self.hass.async_add_executor_job(
+                        self.api_client.select_delivery_site_if_valid_id,
+                        self.delivery_site_id,
+                    )
+                await self.statistics.import_recent_statistics()
+            except HelenAuthenticationException as err:
+                raise ConfigEntryAuthFailed from err
+            except InvalidApiResponseException as err:
+                _LOGGER.warning("Helen API error during consumption import: %s", err)
+                if raise_on_error:
+                    raise
+            except Exception:
+                _LOGGER.exception("Unexpected error during consumption import")
+                if raise_on_error:
+                    raise
+            finally:
+                self.api_client.close()
 
     async def _login_if_needed(self) -> None:
         """Ensure the API client has a valid session."""

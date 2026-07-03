@@ -15,6 +15,7 @@ import; the setup/timer tests mock the coordinator at its smallest seam.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -111,6 +112,71 @@ async def test_auth_error_always_raises_config_entry_auth_failed() -> None:
         await coord.async_update()
     with pytest.raises(ConfigEntryAuthFailed):
         await coord.async_update(raise_on_error=True)
+
+
+# --- overlapping-poll guard (issue #7) --------------------------------------
+
+
+async def test_concurrent_poll_is_skipped_not_queued() -> None:
+    """A poll running while another holds the lock is skipped, not queued."""
+    coord = _coordinator()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def _blocking_import() -> None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+
+    coord.statistics.import_recent_statistics = _blocking_import
+
+    # A acquires the lock and blocks inside the import.
+    task_a = asyncio.create_task(coord.async_update())
+    await started.wait()
+    assert coord._update_lock.locked() is True
+
+    # B runs while A holds the lock: it must return immediately without a
+    # second import (skip, not queue).
+    await coord.async_update()
+    assert calls == 1
+    assert coord._update_lock.locked() is True
+
+    # Let A finish; no extra import happened.
+    release.set()
+    await task_a
+    assert calls == 1
+    assert coord._update_lock.locked() is False
+
+
+async def test_sequential_polls_both_run() -> None:
+    """Two non-overlapping polls both execute; the lock frees between them."""
+    coord = _coordinator()
+    coord.statistics.import_recent_statistics = AsyncMock()
+
+    await coord.async_update()
+    assert coord._update_lock.locked() is False
+    await coord.async_update()
+
+    assert coord.statistics.import_recent_statistics.await_count == 2
+
+
+async def test_exception_releases_the_lock() -> None:
+    """An error inside a poll still releases the lock (async with unwinds)."""
+    coord = _coordinator()
+    coord.statistics.import_recent_statistics = AsyncMock(
+        side_effect=RuntimeError("boom")
+    )
+
+    # Fail-quiet path swallows the error, but the lock must release.
+    await coord.async_update()
+    assert coord._update_lock.locked() is False
+
+    # A following poll runs, proving the lock was freed on the error path.
+    coord.statistics.import_recent_statistics = AsyncMock()
+    await coord.async_update()
+    assert coord.statistics.import_recent_statistics.await_count == 1
 
 
 async def test_setup_propagates_auth_failure_unchanged() -> None:
