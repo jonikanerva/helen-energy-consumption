@@ -43,7 +43,7 @@ def _entry(offset: int, electricity: float | None) -> SimpleNamespace:
 
 def _manager() -> HelenConsumptionStatistics:
     """Build a statistics manager with mocked HA and API dependencies."""
-    return HelenConsumptionStatistics(MagicMock(), MagicMock(), "entry-id", "Helen")
+    return HelenConsumptionStatistics(MagicMock(), MagicMock(), "12345678", "Helen")
 
 
 async def test_transient_read_error_does_not_rewrite_from_zero() -> None:

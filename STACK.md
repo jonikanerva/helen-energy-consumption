@@ -53,11 +53,14 @@ annotations` in every module. Full static-type enforcement mode is **user-owned*
 
 ## Persistence shape
 
-- **Config entry data:** `username`, `password`, optional `delivery_site_id`.
+- **Config entry data:** `username`, `password`, and a required
+  `delivery_site_id` (the Helen delivery-site id, chosen in the config flow —
+  auto-selected for single-site accounts, picked from a dropdown otherwise).
   Nothing else is persisted in the entry.
 - **Statistics:** one external statistic per config entry,
-  `statistic_id = helen_energy_consumption:hourly_energy_consumption_<8-char suffix>`,
-  unit `kWh`, `has_sum = True`, cumulative `state`/`sum`.
+  `statistic_id = helen_energy_consumption:consumption_<delivery_site_id>`,
+  derived from the Helen delivery-site id (non-`[a-z0-9_]` characters replaced
+  with `_`), unit `kWh`, `has_sum = True`, cumulative `state`/`sum`.
 - The cumulative chain is anchored to the last DB record in the query window;
   gaps are zero-filled and later repaired via `async_adjust_statistics`. The
   automatic poll never rewrites history outside the current rolling window.

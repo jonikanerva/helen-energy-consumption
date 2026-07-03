@@ -26,6 +26,7 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
 from custom_components.helen_energy_consumption import async_setup_entry
+from custom_components.helen_energy_consumption.const import CONF_DELIVERY_SITE_ID
 from custom_components.helen_energy_consumption.coordinator import (
     HelenConsumptionCoordinator,
 )
@@ -36,7 +37,11 @@ _PKG = "custom_components.helen_energy_consumption"
 def _entry() -> MagicMock:
     """Build a config-entry double with the data setup reads."""
     entry = MagicMock()
-    entry.data = {CONF_USERNAME: "user", CONF_PASSWORD: "pass"}
+    entry.data = {
+        CONF_USERNAME: "user",
+        CONF_PASSWORD: "pass",
+        CONF_DELIVERY_SITE_ID: "12345678",
+    }
     entry.entry_id = "test-entry-id"
     entry.title = "Helen"
     return entry
@@ -49,9 +54,11 @@ def _coordinator() -> HelenConsumptionCoordinator:
             MagicMock(),
             _entry(),
             credentials={"username": "user", "password": "pass"},
-            delivery_site_id=None,
+            delivery_site_id="12345678",
         )
     coord._login_if_needed = AsyncMock()
+    # async_update selects the delivery site via the executor; make it awaitable.
+    coord.hass.async_add_executor_job = AsyncMock()
     return coord
 
 
