@@ -248,7 +248,7 @@ class HelenConsumptionStatistics:
 
         recorder = get_instance(self.hass)
         repaired = 0
-        for prev_hour, curr_hour in zip(sorted_hours, sorted_hours[1:]):
+        for prev_hour, curr_hour in zip(sorted_hours, sorted_hours[1:], strict=False):
             if curr_hour != prev_hour + timedelta(hours=1):
                 continue
             if existing[curr_hour] - existing[prev_hour] != 0.0:

@@ -1,0 +1,46 @@
+# This project ships a Home Assistant custom component under
+# `custom_components/`, not an installable Python package. There is no
+# `[build-system]`, so uv installs only the dependencies below and never tries
+# to build the repo itself (`tool.uv.package = false` makes that explicit).
+
+[project]
+name = "helen-energy-consumption"
+version = "0.1.0"
+description = "Helen electricity consumption into Home Assistant statistics."
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false
+# Home Assistant depends on pre-release packages (e.g. aiohasupervisor beta),
+# so the resolver must accept them. Scoped to this dev-only project.
+prerelease = "allow"
+
+# Dev-only dependencies (PEP 735). The `dev` group is synced by default, so
+# `uv sync` provisions the full test/lint harness. Home Assistant is pinned to
+# the 2025.1 series via `pytest-homeassistant-custom-component`, matching the
+# `hacs.json` minimum. `oma-helen-cli` mirrors the exact `manifest.json` pin so
+# the component is importable in tests.
+[dependency-groups]
+dev = [
+    "homeassistant>=2025.1,<2025.2",
+    "pytest-homeassistant-custom-component",
+    "pytest",
+    "ruff",
+    "oma-helen-cli==1.8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# Put the repo root on sys.path so `custom_components` imports as a namespace
+# package in tests, the same layout Home Assistant loads at runtime.
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
