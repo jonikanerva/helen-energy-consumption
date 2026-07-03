@@ -1,5 +1,7 @@
 """Constants for the Helen Energy Consumption integration."""
 
+from __future__ import annotations
+
 from datetime import timedelta
 from typing import Final
 

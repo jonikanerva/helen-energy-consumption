@@ -40,6 +40,14 @@ from .const import DOMAIN, STATISTICS_BACKFILL_HOURS
 _LOGGER = logging.getLogger(__name__)
 
 
+class StatisticsQueryError(Exception):
+    """Raised when the recorder query for existing statistics fails.
+
+    Signals the caller to skip this poll rather than treat the error as an
+    empty database and rewrite history from zero (VISION principle 5).
+    """
+
+
 def _safe_round(value: float | None, decimals: int = 3) -> float:
     """Round a value, returning 0.0 if it is None or non-numeric."""
     if value is None:
@@ -163,9 +171,7 @@ class HelenConsumptionStatistics:
 
         earliest_api = min(api_entries.keys())
 
-        real_hours = [
-            h for h, e in api_entries.items() if e.electricity is not None
-        ]
+        real_hours = [h for h, e in api_entries.items() if e.electricity is not None]
         if not real_hours:
             _LOGGER.debug("No hours with real consumption data yet, skipping")
             return
@@ -175,16 +181,23 @@ class HelenConsumptionStatistics:
             minute=0, second=0, microsecond=0
         )
         window_end = now_utc + timedelta(hours=1)
-        existing = await self._get_existing_statistics_in_window(
-            self.consumption_statistic_id, earliest_api, window_end
-        )
+        try:
+            existing = await self._get_existing_statistics_in_window(
+                self.consumption_statistic_id, earliest_api, window_end
+            )
+        except StatisticsQueryError:
+            # History could not be read. Skip this poll; a later one retries.
+            return
 
-        # Repair previously zero-filled hours that now have real data.
-        await self._repair_zero_filled_hours(api_entries, existing)
+        # Repair previously zero-filled hours that now have real data. The
+        # repair cascades its positive delta forward through the DB, including
+        # last_db_hour, so anchor the forward walk on the repaired total to
+        # avoid dropping energy at the boundary.
+        repaired_delta = await self._repair_zero_filled_hours(api_entries, existing)
 
         if existing:
             last_db_hour = max(existing.keys())
-            cumulative = existing[last_db_hour]
+            cumulative = existing[last_db_hour] + repaired_delta
             walk_start = last_db_hour + timedelta(hours=1)
         else:
             cumulative = 0.0
@@ -235,19 +248,22 @@ class HelenConsumptionStatistics:
         self,
         api_entries: dict[datetime, MeasurementsWithSpotPriceSeries],
         existing: dict[datetime, float],
-    ) -> None:
+    ) -> float:
         """Upgrade previously zero-filled hours that now have real API data.
 
         A zero-filled hour leaves the cumulative sum unchanged from the previous
         hour. When real data later arrives, apply the delta via
-        async_adjust_statistics so HA cascades it to all later records.
+        async_adjust_statistics so HA cascades it to all later records. Returns
+        the total repaired delta, which the caller adds to the anchor so the
+        forward walk starts from the post-repair cumulative value.
         """
         sorted_hours = sorted(existing.keys())
         if len(sorted_hours) < 2:
-            return
+            return 0.0
 
         recorder = get_instance(self.hass)
         repaired = 0
+        repaired_delta = 0.0
         for prev_hour, curr_hour in zip(sorted_hours, sorted_hours[1:], strict=False):
             if curr_hour != prev_hour + timedelta(hours=1):
                 continue
@@ -262,6 +278,7 @@ class HelenConsumptionStatistics:
                 self.consumption_statistic_id, curr_hour, entry.electricity, "kWh"
             )
             repaired += 1
+            repaired_delta += entry.electricity
             _LOGGER.debug(
                 "Repaired zero-filled hour %s: +%.3f kWh",
                 curr_hour.isoformat(),
@@ -275,10 +292,16 @@ class HelenConsumptionStatistics:
                 self.consumption_statistic_id,
             )
 
+        return repaired_delta
+
     async def _get_existing_statistics_in_window(
         self, statistic_id: str, start_time: datetime, end_time: datetime
     ) -> dict[datetime, float]:
-        """Return {hour: cumulative sum} for existing records in the window."""
+        """Return {hour: cumulative sum} for existing records in the window.
+
+        Raises StatisticsQueryError if the recorder query fails, so the caller
+        can skip the poll instead of mistaking the error for an empty database.
+        """
         try:
             stats = await get_instance(self.hass).async_add_executor_job(
                 statistics_during_period,
@@ -290,9 +313,16 @@ class HelenConsumptionStatistics:
                 None,
                 {"sum"},
             )
-        except Exception as err:  # noqa: BLE001 - query is best-effort
-            _LOGGER.warning("Error querying existing statistics: %s", err)
-            return {}
+        except Exception as err:  # noqa: BLE001 - re-raised to abort the poll safely
+            # A read failure must not be mistaken for an empty database: the
+            # caller would rewrite the whole window from zero and corrupt real
+            # history. Signal the failure so the poll is skipped instead.
+            _LOGGER.warning(
+                "Error querying existing statistics; skipping poll to preserve "
+                "history: %s",
+                err,
+            )
+            raise StatisticsQueryError(str(err)) from err
 
         existing: dict[datetime, float] = {}
         for stat in stats.get(statistic_id, []):

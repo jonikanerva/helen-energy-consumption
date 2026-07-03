@@ -11,7 +11,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.event import async_track_time_interval
 
 from .const import CONF_DELIVERY_SITE_ID, SCAN_INTERVAL
@@ -40,6 +40,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # A failure here (bad credentials, API down) surfaces as a retryable setup.
     try:
         await coordinator.async_update()
+    except ConfigEntryAuthFailed:
+        # Let HA start the reauth flow; do not mask it as a retryable setup.
+        coordinator.close()
+        raise
     except Exception as err:
         coordinator.close()
         raise ConfigEntryNotReady(
@@ -48,7 +52,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # There are no entities to drive a DataUpdateCoordinator, so poll on a timer.
     async def _scheduled_update(_now) -> None:
-        await coordinator.async_update()
+        try:
+            await coordinator.async_update()
+        except ConfigEntryAuthFailed:
+            # The timer path has no setup machinery to catch this, so trigger
+            # reauth explicitly instead of letting it be silently logged.
+            entry.async_start_reauth(hass)
 
     entry.async_on_unload(
         async_track_time_interval(hass, _scheduled_update, SCAN_INTERVAL)
