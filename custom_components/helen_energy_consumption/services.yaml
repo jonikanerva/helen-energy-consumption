@@ -1,0 +1,25 @@
+backfill:
+  name: Backfill consumption history
+  description: >-
+    Re-derive hourly electricity consumption from Helen for a delivery site,
+    from a start date through now, rebuilding its statistics chain. Hours Helen
+    has data for are re-derived; hours it does not are preserved from existing
+    data. Data before the start date is left untouched. Use it to import history
+    on onboarding or to repair a range.
+  fields:
+    start_date:
+      name: Start date
+      description: >-
+        The first day to rebuild, from 00:00 Europe/Helsinki through now.
+      required: true
+      selector:
+        date:
+    config_entry_id:
+      name: Delivery site
+      description: >-
+        Which configured delivery site to rebuild. Required only when more than
+        one delivery site is configured.
+      required: false
+      selector:
+        config_entry:
+          integration: helen_energy_consumption

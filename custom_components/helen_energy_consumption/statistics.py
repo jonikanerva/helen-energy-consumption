@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from helenservice import RESOLUTION_HOUR, HelenApiClient
@@ -21,6 +21,7 @@ from helenservice.api_response import (
 )
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
+from homeassistant.exceptions import HomeAssistantError
 
 # StatisticMeanType is only available in newer HA cores.
 try:
@@ -40,6 +41,10 @@ from homeassistant.util import dt as dt_util
 from .const import DOMAIN, STATISTICS_BACKFILL_HOURS
 
 _LOGGER = logging.getLogger(__name__)
+
+# Lower bound for the strict pre-start anchor read (statistics_during_period
+# requires a start_time; the Unix epoch is safely before any Helen data).
+_ANCHOR_READ_START = dt_util.utc_from_timestamp(0)
 
 
 class StatisticsQueryError(Exception):
@@ -130,6 +135,12 @@ class HelenConsumptionStatistics:
         except Exception as err:  # noqa: BLE001 - contract start is best-effort
             _LOGGER.debug("Could not read contract start date: %s", err)
 
+        return await self._fetch_range_data(start_date, end_date)
+
+    async def _fetch_range_data(
+        self, start_date: date, end_date: date
+    ) -> list[MeasurementsWithSpotPriceSeries]:
+        """Fetch hourly consumption for [start_date, end_date] in the executor."""
         _LOGGER.debug("Fetching hourly consumption from %s to %s", start_date, end_date)
 
         try:
@@ -362,8 +373,103 @@ class HelenConsumptionStatistics:
             )
         return rows
 
+    async def rebuild_range(self, start_date: date) -> None:
+        """Rebuild the cumulative chain for [start_date, now] from Helen data.
+
+        Re-derives each hour from the Helen API where available and preserves
+        the existing DB contribution otherwise, then performs a SINGLE
+        async_add_external_statistics write. Everything before that write is a
+        read or an in-memory computation, so any failure (fetch, empty response,
+        recorder read) raises before the write and leaves prior statistics fully
+        intact (VISION principle 5). Rows before start_utc are never touched.
+        """
+        await self._ensure_helsinki_tz()
+
+        # Helsinki 00:00 of start_date, converted to the UTC hour bucket.
+        start_utc = self._convert_to_utc(
+            datetime.combine(start_date, time.min).isoformat()
+        ).replace(minute=0, second=0, microsecond=0)
+        now_hour = dt_util.utcnow().replace(minute=0, second=0, microsecond=0)
+
+        series = await self._fetch_range_data(start_date, date.today())
+        if not series:
+            raise HomeAssistantError(
+                f"Helen returned no consumption data for "
+                f"{self.consumption_statistic_id} from {start_date}"
+            )
+
+        api_elec: dict[datetime, float | None] = {}
+        for entry in series:
+            hour = self._convert_to_utc(entry.start).replace(
+                minute=0, second=0, microsecond=0
+            )
+            api_elec[hour] = entry.electricity
+
+        # end_time=None so max(in_range) is the TRUE DB tail (GUARD #2): the
+        # rebuild covers every existing hour and is never truncated below it.
+        in_range = await self._get_existing_statistics_in_window(
+            self.consumption_statistic_id, start_utc, None
+        )
+        anchor_sum = await self._get_anchor_sum(start_utc)
+
+        rebuild_end = max(now_hour, max(in_range)) if in_range else now_hour
+
+        rows: list[StatisticData] = []
+        cumulative = anchor_sum  # predecessor sum; the anchor for the first hour
+        current_hour = start_utc
+        while current_hour <= rebuild_end:
+            api_value = api_elec.get(current_hour)
+            if api_value is not None:
+                elec = api_value
+            elif current_hour in in_range:
+                # Preserve rule (GUARD #1): keep this real hour's contribution
+                # measured against the RUNNING predecessor (cumulative), never
+                # an absent in_range[h-1]. A genuine zero-consumption hour gives
+                # delta 0 and harmlessly holds the sum flat.
+                elec = in_range[current_hour] - cumulative
+            else:
+                elec = 0.0
+
+            elec = max(elec, 0.0)  # Helen consumption is non-negative (defensive)
+            cumulative += elec
+            rows.append(
+                StatisticData(
+                    start=current_hour,
+                    state=_safe_round(cumulative),
+                    sum=_safe_round(cumulative),
+                )
+            )
+            current_hour += timedelta(hours=1)
+
+        if not rows:
+            return
+
+        # Single, all-or-nothing write. Nothing was written before this line.
+        await self._import_statistics(rows)
+        _LOGGER.info(
+            "Backfill rebuilt %d hour(s) for %s from %s",
+            len(rows),
+            self.consumption_statistic_id,
+            start_utc.isoformat(),
+        )
+
+    async def _get_anchor_sum(self, start_utc: datetime) -> float:
+        """Return the cumulative sum of the last row strictly before start_utc.
+
+        Anchors the rebuild so it stays continuous with untouched history.
+        Returns 0.0 when there is no prior row (onboarding). The read is strict
+        (start < start_utc), matching the rebuild's inclusive start at start_utc
+        so the anchor hour is never double-counted.
+        """
+        before = await self._get_existing_statistics_in_window(
+            self.consumption_statistic_id, _ANCHOR_READ_START, start_utc
+        )
+        if not before:
+            return 0.0
+        return before[max(before)]
+
     async def _get_existing_statistics_in_window(
-        self, statistic_id: str, start_time: datetime, end_time: datetime
+        self, statistic_id: str, start_time: datetime, end_time: datetime | None
     ) -> dict[datetime, float]:
         """Return {hour: cumulative sum} for existing records in the window.
 
