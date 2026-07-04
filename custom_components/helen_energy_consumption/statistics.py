@@ -302,7 +302,7 @@ class HelenConsumptionStatistics:
             combined = missing_rows + stats
             if combined:
                 await self._import_statistics(combined)
-                _LOGGER.info(
+                _LOGGER.debug(
                     "Wrote %d hour(s) for %s (interior_gap=%d, zero_filled=%d)",
                     len(combined),
                     self.consumption_statistic_id,
@@ -368,7 +368,7 @@ class HelenConsumptionStatistics:
             )
 
         if repairs:
-            _LOGGER.info(
+            _LOGGER.debug(
                 "Repaired %d zero-filled hour(s) for %s",
                 len(repairs),
                 self.consumption_statistic_id,
