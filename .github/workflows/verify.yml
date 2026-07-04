@@ -1,0 +1,30 @@
+name: Verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      # uv's wheel cache. mise-action's built-in cache covers only the mise
+      # tools (python, uv); the packages `uv sync` downloads are cached here.
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+      # Third-party action: pinned to an immutable commit SHA (tag v4.2.0).
+      # Unlike the hassfest/hacs workflows, verify has no drift-detection
+      # purpose, so nothing here floats; bumps are deliberate manual steps.
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - run: mise run verify
