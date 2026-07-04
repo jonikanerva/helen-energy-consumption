@@ -21,4 +21,4 @@ SCAN_INTERVAL: Final = timedelta(hours=3)
 # with a lag of a day or two, so a rolling window lets late-arriving hours be
 # repaired. Hours older than this window stay zero-filled if they were ever
 # missing.
-STATISTICS_BACKFILL_HOURS: Final = 168  # 7 days
+ROLLING_WINDOW_HOURS: Final = 168  # 7 days

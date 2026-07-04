@@ -19,5 +19,5 @@ def test_poll_interval_is_three_hours() -> None:
     assert const.SCAN_INTERVAL == timedelta(hours=3)
 
 
-def test_backfill_window_is_seven_days() -> None:
-    assert const.STATISTICS_BACKFILL_HOURS == 168
+def test_rolling_window_is_seven_days() -> None:
+    assert const.ROLLING_WINDOW_HOURS == 168

@@ -14,17 +14,19 @@ import re
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from helenservice import RESOLUTION_HOUR, HelenApiClient
+from helenservice.api_client import HelenApiClient
 from helenservice.api_exceptions import InvalidApiResponseException
 from helenservice.api_response import (
     MeasurementsWithSpotPriceResponse,
     MeasurementsWithSpotPriceSeries,
 )
+from helenservice.const import RESOLUTION_HOUR
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 
-# StatisticMeanType is only available in newer HA cores.
+# Forward-compat: StatisticMeanType is the metadata API on HA > 2025.1;
+# has_mean=False is the 2025.1 fallback.
 try:
     from homeassistant.components.recorder.models import StatisticMeanType
 
@@ -39,7 +41,7 @@ from homeassistant.const import UnitOfEnergy
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN, STATISTICS_BACKFILL_HOURS
+from .const import DOMAIN, ROLLING_WINDOW_HOURS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -140,7 +142,7 @@ class HelenConsumptionStatistics:
         _LOGGER.debug(
             "Initialized consumption statistics for %s (%d hour window)",
             self.consumption_statistic_id,
-            STATISTICS_BACKFILL_HOURS,
+            ROLLING_WINDOW_HOURS,
         )
 
     async def import_recent_statistics(self) -> None:
@@ -151,7 +153,7 @@ class HelenConsumptionStatistics:
     async def _fetch_interval_data(self) -> list[MeasurementsWithSpotPriceSeries]:
         """Fetch hourly consumption for the rolling backfill window."""
         end_date = date.today()
-        start_date = end_date - timedelta(days=STATISTICS_BACKFILL_HOURS // 24 + 1)
+        start_date = end_date - timedelta(days=ROLLING_WINDOW_HOURS // 24 + 1)
 
         # Clamp to contract start so new contracts don't 403 on the pre-contract
         # part of the window.
@@ -441,7 +443,10 @@ class HelenConsumptionStatistics:
         # never hold up a concurrent poll of the same chain.
         series = await self._fetch_range_data(start_date, date.today())
         if not series:
-            raise HomeAssistantError(
+            # The caller asked for a range Helen has no data for: idiomatic
+            # service-validation error (cf. the all-unparseable / tz cases,
+            # which are systemic HomeAssistantError).
+            raise ServiceValidationError(
                 f"Helen returned no consumption data for "
                 f"{self.consumption_statistic_id} from {start_date}"
             )

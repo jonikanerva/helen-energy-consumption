@@ -38,6 +38,10 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+# Types entry.runtime_data as the coordinator at the setup/service boundary
+# (documentary — ruff does not type-check). No runtime effect.
+type HelenConfigEntry = ConfigEntry[HelenConsumptionCoordinator]
+
 _BACKFILL_SCHEMA = vol.Schema(
     {
         vol.Required(ATTR_START_DATE): cv.date,
@@ -46,7 +50,9 @@ _BACKFILL_SCHEMA = vol.Schema(
 )
 
 
-def _resolve_target_entry(hass: HomeAssistant, entry_id: str | None) -> ConfigEntry:
+def _resolve_target_entry(
+    hass: HomeAssistant, entry_id: str | None
+) -> HelenConfigEntry:
     """Resolve the backfill target: the given entry, or the sole loaded one."""
     if entry_id is not None:
         entry = hass.config_entries.async_get_entry(entry_id)
@@ -89,7 +95,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: HelenConfigEntry) -> bool:
     """Set up Helen Energy Consumption from a config entry."""
     coordinator = HelenConsumptionCoordinator(
         hass,
@@ -135,6 +141,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: HelenConfigEntry) -> bool:
     """Unload a config entry."""
     return True
