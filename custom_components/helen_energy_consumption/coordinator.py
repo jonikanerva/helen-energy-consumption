@@ -168,7 +168,8 @@ class HelenConsumptionCoordinator:
         A missing contract start (None) is treated as an unknowable bound and
         allowed through, so the rebuild proceeds best-effort.
         """
-        if start_date > date.today():
+        today = await self.statistics.helsinki_today()
+        if start_date > today:
             raise ServiceValidationError(f"start_date {start_date} is in the future")
 
         contract_start = await self.hass.async_add_executor_job(

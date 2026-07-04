@@ -8,7 +8,7 @@ future without touching the write path.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -168,11 +168,26 @@ async def test_backfill_rejects_start_before_contract() -> None:
 async def test_backfill_rejects_future_start() -> None:
     """A future start_date is rejected before any rebuild."""
     coord = _coordinator(contract_start=None)
+    coord.statistics.helsinki_today = AsyncMock(return_value=date(2026, 1, 15))
 
     with pytest.raises(ServiceValidationError):
-        await coord.async_backfill(date.today() + timedelta(days=1))
+        await coord.async_backfill(date(2026, 1, 16))
 
     coord.statistics.rebuild_range.assert_not_called()
+
+
+async def test_backfill_future_check_uses_helsinki_date() -> None:
+    """The future-date check compares against the Helsinki calendar day."""
+    coord = _coordinator(contract_start=None)
+    coord.statistics.helsinki_today = AsyncMock(return_value=date(2026, 1, 16))
+
+    # Same Helsinki day: not future — proceeds to the rebuild.
+    await coord.async_backfill(date(2026, 1, 16))
+    coord.statistics.rebuild_range.assert_awaited_once_with(date(2026, 1, 16))
+
+    # One day past the Helsinki today: rejected.
+    with pytest.raises(ServiceValidationError):
+        await coord.async_backfill(date(2026, 1, 17))
 
 
 async def test_backfill_allows_unknown_contract_start() -> None:

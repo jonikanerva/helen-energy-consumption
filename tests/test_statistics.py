@@ -368,6 +368,42 @@ async def test_convert_naive_dst_fallback_collapses_via_fold_zero() -> None:
     assert result == datetime(2025, 10, 26, 0, 30, tzinfo=_UTC)
 
 
+# --- helsinki_today (Helen calendar edge, issue #36) --------------------------
+
+
+async def test_helsinki_today_crosses_utc_midnight() -> None:
+    """22:30Z in winter (UTC+2) is already the next calendar day in Helsinki."""
+    manager = _manager()
+    with patch(
+        f"{_STATS_MODULE}.dt_util.utcnow",
+        return_value=datetime(2026, 1, 15, 22, 30, tzinfo=_UTC),
+    ):
+        assert await manager.helsinki_today() == date(2026, 1, 16)
+
+
+async def test_helsinki_today_summer_offset() -> None:
+    """21:30Z in summer (EEST, UTC+3) is already the next Helsinki day."""
+    manager = _manager()
+    with patch(
+        f"{_STATS_MODULE}.dt_util.utcnow",
+        return_value=datetime(2026, 7, 3, 21, 30, tzinfo=_UTC),
+    ):
+        assert await manager.helsinki_today() == date(2026, 7, 4)
+
+
+async def test_helsinki_today_fails_closed_without_zone() -> None:
+    """An unresolvable Helsinki zone raises instead of drifting to host/UTC."""
+    manager = _manager()
+    with (
+        patch(
+            f"{_STATS_MODULE}.dt_util.async_get_time_zone",
+            new=AsyncMock(return_value=None),
+        ),
+        pytest.raises(HomeAssistantError),
+    ):
+        await manager.helsinki_today()
+
+
 # --- rebuild_range (backfill action, issue #10) -----------------------------
 
 
@@ -902,11 +938,15 @@ def _measurements(series: list) -> SimpleNamespace:
 async def test_fetch_clamps_before_contract_start() -> None:
     """A contract that starts after the window end yields [] and no fetch call."""
     manager = _executor_manager()
-    manager.api_client.get_contract_start_date.return_value = date.today() + timedelta(
-        days=1
-    )
+    # Window end is the Helsinki day 2026-01-16 (22:30Z winter); the contract
+    # starting the day after is entirely outside the window.
+    manager.api_client.get_contract_start_date.return_value = date(2026, 1, 17)
 
-    assert await manager._fetch_interval_data() == []
+    with patch(
+        f"{_STATS_MODULE}.dt_util.utcnow",
+        return_value=datetime(2026, 1, 15, 22, 30, tzinfo=_UTC),
+    ):
+        assert await manager._fetch_interval_data() == []
     manager.api_client.get_measurements_with_spot_prices.assert_not_called()
 
 
@@ -954,10 +994,14 @@ async def test_fetch_happy_path_uses_correct_positional_signature() -> None:
         series
     )
 
-    result = await manager._fetch_interval_data()
+    with patch(
+        f"{_STATS_MODULE}.dt_util.utcnow",
+        return_value=datetime(2026, 1, 15, 22, 30, tzinfo=_UTC),
+    ):
+        result = await manager._fetch_interval_data()
 
     assert result is series
-    expected_end = date.today()
+    expected_end = date(2026, 1, 16)  # 22:30Z winter -> next Helsinki day
     expected_start = expected_end - timedelta(days=ROLLING_WINDOW_HOURS // 24 + 1)
     # Positional arg-order guard: (start: date, end: date, resolution).
     manager.api_client.get_measurements_with_spot_prices.assert_called_once_with(
