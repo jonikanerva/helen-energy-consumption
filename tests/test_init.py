@@ -16,7 +16,7 @@ import; the setup/timer tests mock the coordinator at its smallest seam.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from helenservice.api_exceptions import (
@@ -99,6 +99,18 @@ async def test_setup_import_reraises_generic_error() -> None:
     )
     with pytest.raises(RuntimeError):
         await coord.async_update(raise_on_error=True)
+
+
+async def test_update_closes_client_in_executor() -> None:
+    """The poll-path client close is executor-routed, never run on the loop."""
+    coord = _coordinator()
+    coord.statistics.import_recent_statistics = AsyncMock()
+
+    await coord.async_update()
+
+    exec_calls = coord.hass.async_add_executor_job.await_args_list
+    assert call(coord.api_client.close) in exec_calls
+    coord.api_client.close.assert_not_called()
 
 
 async def test_auth_error_always_raises_config_entry_auth_failed() -> None:

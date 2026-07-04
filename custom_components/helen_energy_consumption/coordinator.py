@@ -17,7 +17,11 @@ from helenservice.api_exceptions import (
     HelenAuthenticationException,
     InvalidApiResponseException,
 )
-from homeassistant.exceptions import ConfigEntryAuthFailed, ServiceValidationError
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    HomeAssistantError,
+    ServiceValidationError,
+)
 
 from .statistics import HelenConsumptionStatistics
 
@@ -93,7 +97,7 @@ class HelenConsumptionCoordinator:
                 if raise_on_error:
                     raise
             finally:
-                self.api_client.close()
+                await self.hass.async_add_executor_job(self.api_client.close)
 
     async def async_backfill(self, start_date: date) -> None:
         """Rebuild this delivery site's chain for [start_date, now] from Helen.
@@ -104,6 +108,12 @@ class HelenConsumptionCoordinator:
         start before rebuilding. All Helen calls run in the executor; any
         failure raises before the single statistics write, leaving prior data
         intact (VISION principle 5).
+
+        Failures are mapped to the HA taxonomy (STACK.md §8) so no raw
+        helenservice exception escapes into HA: HomeAssistantError subclasses
+        (ServiceValidationError, ConfigEntryAuthFailed) pass through untouched;
+        an auth failure starts reauth and surfaces as HomeAssistantError; every
+        other failure is wrapped as HomeAssistantError for the action UI.
         """
         async with self._update_lock:
             try:
@@ -114,8 +124,29 @@ class HelenConsumptionCoordinator:
                 )
                 await self._validate_backfill_range(start_date)
                 await self.statistics.rebuild_range(start_date)
+            except HomeAssistantError:
+                # Must stay first: ServiceValidationError and
+                # ConfigEntryAuthFailed are HomeAssistantError subclasses; a
+                # later generic clause would re-wrap them and break the
+                # action-UI rendering.
+                raise
+            except HelenAuthenticationException as err:
+                self.entry.async_start_reauth(self.hass)
+                raise HomeAssistantError(
+                    "Helen authentication failed during backfill; "
+                    "re-authentication started"
+                ) from err
+            except InvalidApiResponseException as err:
+                raise HomeAssistantError(
+                    f"Helen API error during backfill: {err}"
+                ) from err
+            except Exception as err:
+                _LOGGER.exception("Unexpected error during Helen backfill")
+                raise HomeAssistantError(
+                    f"Unexpected error during backfill: {err}"
+                ) from err
             finally:
-                self.api_client.close()
+                await self.hass.async_add_executor_job(self.api_client.close)
 
     async def _validate_backfill_range(self, start_date: date) -> None:
         """Reject a start_date in the future or before available history.
@@ -139,7 +170,7 @@ class HelenConsumptionCoordinator:
         """Ensure the API client has a valid session."""
         if self.api_client.is_session_valid():
             return
-        self.api_client.close()
+        await self.hass.async_add_executor_job(self.api_client.close)
         await self.hass.async_add_executor_job(
             lambda: self.api_client.login_and_init(**self.credentials)
         )

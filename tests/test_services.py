@@ -12,8 +12,12 @@ from datetime import date, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from helenservice.api_exceptions import (
+    HelenAuthenticationException,
+    InvalidApiResponseException,
+)
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.exceptions import ServiceValidationError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 
 from custom_components.helen_energy_consumption import (
     _resolve_target_entry,
@@ -178,3 +182,71 @@ async def test_backfill_allows_unknown_contract_start() -> None:
     await coord.async_backfill(date(2026, 1, 15))
 
     coord.statistics.rebuild_range.assert_awaited_once_with(date(2026, 1, 15))
+
+
+# --- error taxonomy (coordinator.async_backfill, STACK.md §8) -----------------
+
+
+async def test_backfill_auth_failure_starts_reauth_and_wraps() -> None:
+    """An auth failure starts reauth and surfaces as HomeAssistantError."""
+    coord = _coordinator(contract_start=None)
+    coord._login_if_needed = AsyncMock(
+        side_effect=HelenAuthenticationException("bad creds")
+    )
+
+    with pytest.raises(HomeAssistantError, match="re-authentication started"):
+        await coord.async_backfill(date(2026, 1, 15))
+
+    coord.entry.async_start_reauth.assert_called_once_with(coord.hass)
+    coord.statistics.rebuild_range.assert_not_called()
+
+
+async def test_backfill_api_error_wraps_without_reauth() -> None:
+    """An API error surfaces as HomeAssistantError; reauth is not started."""
+    coord = _coordinator(contract_start=None)
+    coord.statistics.rebuild_range = AsyncMock(
+        side_effect=InvalidApiResponseException("Helen down")
+    )
+
+    with pytest.raises(HomeAssistantError, match="Helen API error during backfill"):
+        await coord.async_backfill(date(2026, 1, 15))
+
+    coord.entry.async_start_reauth.assert_not_called()
+
+
+async def test_backfill_unexpected_error_wraps_as_home_assistant_error() -> None:
+    """An unexpected error is wrapped as HomeAssistantError, not raised raw."""
+    coord = _coordinator(contract_start=None)
+    coord.statistics.rebuild_range = AsyncMock(side_effect=RuntimeError("boom"))
+
+    with pytest.raises(HomeAssistantError, match="Unexpected error during backfill"):
+        await coord.async_backfill(date(2026, 1, 15))
+
+
+async def test_backfill_home_assistant_error_passes_through_untouched() -> None:
+    """A HomeAssistantError from the rebuild is re-raised, not re-wrapped."""
+    coord = _coordinator(contract_start=None)
+    sentinel = HomeAssistantError("sentinel")
+    coord.statistics.rebuild_range = AsyncMock(side_effect=sentinel)
+
+    with pytest.raises(HomeAssistantError) as excinfo:
+        await coord.async_backfill(date(2026, 1, 15))
+
+    assert excinfo.value is sentinel
+
+
+async def test_backfill_closes_client_in_executor() -> None:
+    """The client close is submitted to the executor, never run on the loop."""
+    coord = _coordinator(contract_start=None)
+    submitted: list[object] = []
+
+    async def _recording_exec(func, *args):
+        submitted.append(func)
+        return None  # contract start unknown -> proceed best-effort
+
+    coord.hass.async_add_executor_job = _recording_exec
+
+    await coord.async_backfill(date(2026, 1, 15))
+
+    assert coord.api_client.close in submitted
+    coord.api_client.close.assert_not_called()
