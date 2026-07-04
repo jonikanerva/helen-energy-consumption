@@ -49,7 +49,7 @@ annotations` in every module. Full static-type enforcement mode is **user-owned*
 
 - All Helen API and recorder calls run in the executor
   (`hass.async_add_executor_job`) — **never block the event loop**.
-- One poll fetches at most a 7-day hourly window (`STATISTICS_BACKFILL_HOURS`);
+- One poll fetches at most a 7-day hourly window (`ROLLING_WINDOW_HOURS`);
   do not widen the default rolling window without a documented reason.
 - Default poll interval: **3 hours**. Do not poll more often than hourly —
   Helen's data lags 1–2 days, so faster polling buys nothing.
