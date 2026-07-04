@@ -90,6 +90,26 @@ def _safe_round(value: float | None, decimals: int = 3) -> float:
         return 0.0
 
 
+def _floor_hour(dt: datetime) -> datetime:
+    """Floor a datetime to the top of its hour, preserving tzinfo and fold."""
+    return dt.replace(minute=0, second=0, microsecond=0)
+
+
+def _accumulate_row(
+    cumulative: float, elec: float, hour: datetime
+) -> tuple[float, StatisticData]:
+    """Add one hour's energy to the running cumulative and emit its chain row.
+
+    Returns the UNROUNDED cumulative (the running carry) and a StatisticData
+    whose ``state`` and ``sum`` share one ``_safe_round(cumulative)`` value. No
+    clamping happens here — each caller resolves/clamps ``elec`` beforehand as
+    its own algorithm requires.
+    """
+    cumulative += elec
+    rounded = _safe_round(cumulative)
+    return cumulative, StatisticData(start=hour, state=rounded, sum=rounded)
+
+
 class HelenConsumptionStatistics:
     """Import Helen hourly consumption into the HA statistics database."""
 
@@ -202,25 +222,19 @@ class HelenConsumptionStatistics:
         # loop, so _convert_to_utc never blocks on tzdata I/O.
         await self._ensure_helsinki_tz()
 
-        api_entries: dict[datetime, MeasurementsWithSpotPriceSeries] = {}
-        for entry in series:
-            hour = self._convert_to_utc(entry.start).replace(
-                minute=0, second=0, microsecond=0
-            )
-            api_entries[hour] = entry
-
-        if not api_entries:
+        api_elec = self._bucket_series_by_utc_hour(series)
+        if not api_elec:
             return
 
-        earliest_api = min(api_entries.keys())
+        earliest_api = min(api_elec.keys())
 
-        real_hours = [h for h, e in api_entries.items() if e.electricity is not None]
+        real_hours = [h for h, elec in api_elec.items() if elec is not None]
         if not real_hours:
             _LOGGER.debug("No hours with real consumption data yet, skipping")
             return
         latest_real_hour = max(real_hours)
 
-        now_utc = dt_util.utcnow().replace(minute=0, second=0, microsecond=0)
+        now_utc = _floor_hour(dt_util.utcnow())
         window_end = now_utc + timedelta(hours=1)
 
         # Serialize the whole read -> repair -> write against any other writer of
@@ -239,7 +253,7 @@ class HelenConsumptionStatistics:
             # repair cascades its positive delta forward through the DB,
             # including last_db_hour, so anchor the forward walk on the repaired
             # total to avoid dropping energy at the boundary.
-            repairs = await self._repair_zero_filled_hours(api_entries, existing)
+            repairs = await self._repair_zero_filled_hours(api_elec, existing)
             repaired_delta = sum(delta for _, delta in repairs)
 
             # Flat-fill fully-absent interior hours (gaps strictly between
@@ -268,22 +282,17 @@ class HelenConsumptionStatistics:
             else:
                 current_hour = walk_start
                 while current_hour <= latest_real_hour:
-                    entry = api_entries.get(current_hour)
-                    electricity = entry.electricity if entry else None
+                    electricity = api_elec.get(current_hour)
                     if electricity is None:
                         # No data yet — hold the cumulative sum flat. The repair
                         # pass upgrades this hour once real data arrives.
                         electricity = 0.0
                         zero_filled += 1
 
-                    cumulative += electricity
-                    stats.append(
-                        StatisticData(
-                            start=current_hour,
-                            state=_safe_round(cumulative),
-                            sum=_safe_round(cumulative),
-                        )
+                    cumulative, row = _accumulate_row(
+                        cumulative, electricity, current_hour
                     )
+                    stats.append(row)
                     current_hour += timedelta(hours=1)
 
             # missing_rows (< last_db_hour) and stats (>= last_db_hour + 1h) are
@@ -312,7 +321,7 @@ class HelenConsumptionStatistics:
 
     async def _repair_zero_filled_hours(
         self,
-        api_entries: dict[datetime, MeasurementsWithSpotPriceSeries],
+        api_elec: dict[datetime, float | None],
         existing: dict[datetime, float],
     ) -> list[tuple[datetime, float]]:
         """Upgrade previously zero-filled hours that now have real API data.
@@ -338,18 +347,18 @@ class HelenConsumptionStatistics:
             if existing[curr_hour] - existing[prev_hour] != 0.0:
                 continue  # cumulative moved — hour already has real data
 
-            entry = api_entries.get(curr_hour)
-            if entry is None or entry.electricity is None or entry.electricity == 0.0:
+            elec = api_elec.get(curr_hour)
+            if elec is None or elec == 0.0:
                 continue
 
             recorder.async_adjust_statistics(
-                self.consumption_statistic_id, curr_hour, entry.electricity, "kWh"
+                self.consumption_statistic_id, curr_hour, elec, "kWh"
             )
-            repairs.append((curr_hour, entry.electricity))
+            repairs.append((curr_hour, elec))
             _LOGGER.debug(
                 "Repaired zero-filled hour %s: +%.3f kWh",
                 curr_hour.isoformat(),
-                entry.electricity,
+                elec,
             )
 
         if repairs:
@@ -416,9 +425,9 @@ class HelenConsumptionStatistics:
         await self._ensure_helsinki_tz()
 
         # Helsinki 00:00 of start_date, converted to the UTC hour bucket.
-        start_utc = self._convert_to_utc(
-            datetime.combine(start_date, time.min).isoformat()
-        ).replace(minute=0, second=0, microsecond=0)
+        start_utc = _floor_hour(
+            self._convert_to_utc(datetime.combine(start_date, time.min).isoformat())
+        )
 
         # The slow Helen fetch and bucketing stay OUTSIDE the chain lock so they
         # never hold up a concurrent poll of the same chain.
@@ -429,18 +438,13 @@ class HelenConsumptionStatistics:
                 f"{self.consumption_statistic_id} from {start_date}"
             )
 
-        api_elec: dict[datetime, float | None] = {}
-        for entry in series:
-            hour = self._convert_to_utc(entry.start).replace(
-                minute=0, second=0, microsecond=0
-            )
-            api_elec[hour] = entry.electricity
+        api_elec = self._bucket_series_by_utc_hour(series)
 
         # Serialize both chain reads and the write against any other writer of
         # this chain (issue #18). rebuild_range uses only the idempotent
         # absolute-sum import, so no recorder flush is needed on release.
         async with _chain_lock(self.consumption_statistic_id):
-            now_hour = dt_util.utcnow().replace(minute=0, second=0, microsecond=0)
+            now_hour = _floor_hour(dt_util.utcnow())
 
             # end_time=None so max(in_range) is the TRUE DB tail (GUARD #2): the
             # rebuild covers every existing hour and is never truncated below it.
@@ -468,14 +472,8 @@ class HelenConsumptionStatistics:
                     elec = 0.0
 
                 elec = max(elec, 0.0)  # Helen consumption is non-negative
-                cumulative += elec
-                rows.append(
-                    StatisticData(
-                        start=current_hour,
-                        state=_safe_round(cumulative),
-                        sum=_safe_round(cumulative),
-                    )
-                )
+                cumulative, row = _accumulate_row(cumulative, elec, current_hour)
+                rows.append(row)
                 current_hour += timedelta(hours=1)
 
             if not rows:
@@ -546,7 +544,7 @@ class HelenConsumptionStatistics:
                 )
             else:
                 ts = dt_util.utc_from_timestamp(raw)
-            ts = ts.replace(minute=0, second=0, microsecond=0)
+            ts = _floor_hour(ts)
             existing[ts] = stat.get("sum", 0.0)
         return existing
 
@@ -559,6 +557,20 @@ class HelenConsumptionStatistics:
         """
         if self._helsinki_tz is None:
             self._helsinki_tz = await dt_util.async_get_time_zone("Europe/Helsinki")
+
+    def _bucket_series_by_utc_hour(
+        self, series: list[MeasurementsWithSpotPriceSeries]
+    ) -> dict[datetime, float | None]:
+        """Bucket a Helen series into {UTC hour: electricity} (last write wins).
+
+        Requires _ensure_helsinki_tz() to have run (it uses _convert_to_utc).
+        Kept synchronous and called before the #18 chain lock is taken — the
+        same pre-read position as the inline builds it replaces.
+        """
+        buckets: dict[datetime, float | None] = {}
+        for entry in series:
+            buckets[_floor_hour(self._convert_to_utc(entry.start))] = entry.electricity
+        return buckets
 
     def _convert_to_utc(self, timestamp: str) -> datetime:
         """Convert a Helen ISO 8601 timestamp string to UTC.

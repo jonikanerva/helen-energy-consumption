@@ -27,7 +27,9 @@ from homeassistant.exceptions import HomeAssistantError
 from custom_components.helen_energy_consumption.statistics import (
     HelenConsumptionStatistics,
     StatisticsQueryError,
+    _accumulate_row,
     _chain_lock,
+    _floor_hour,
 )
 
 _UTC = ZoneInfo("UTC")
@@ -752,3 +754,95 @@ def test_chain_lock_identity() -> None:
     """_chain_lock returns one shared lock per id, distinct across ids."""
     assert _chain_lock("id-a") is _chain_lock("id-a")
     assert _chain_lock("id-a") is not _chain_lock("id-b")
+
+
+# --- pure chain kernel & helpers (issue #19) --------------------------------
+
+
+def _raw_entry(start_iso: str, electricity: float | None) -> SimpleNamespace:
+    """Build a fake Helen series entry with a literal ISO start string."""
+    return SimpleNamespace(start=start_iso, electricity=electricity)
+
+
+def test_accumulate_row_returns_unrounded_carry_and_rounded_row() -> None:
+    """The carry is the raw cumulative; state and sum share one rounded value."""
+    cumulative, row = _accumulate_row(0.0, 1.23456, _hour(0))
+    assert cumulative == 1.23456  # unrounded carry
+    assert row["state"] == pytest.approx(1.235)
+    assert row["sum"] == pytest.approx(1.235)
+    assert row["state"] == row["sum"]
+    assert row["start"] == _hour(0)
+
+
+def test_accumulate_row_zero_holds_flat() -> None:
+    cumulative, row = _accumulate_row(5.0, 0.0, _hour(1))
+    assert cumulative == 5.0
+    assert row["sum"] == pytest.approx(5.0)
+
+
+def test_accumulate_row_does_not_clamp() -> None:
+    """The kernel applies no max(): a negative elec lowers the cumulative."""
+    cumulative, row = _accumulate_row(2.0, -0.5, _hour(0))
+    assert cumulative == 1.5
+    assert row["sum"] == pytest.approx(1.5)
+
+
+def test_accumulate_row_carry_stays_unrounded_across_steps() -> None:
+    cumulative = 0.0
+    sums = []
+    for i in range(3):
+        cumulative, row = _accumulate_row(cumulative, 0.1, _hour(i))
+        sums.append(row["sum"])
+    assert sums == [pytest.approx(0.1), pytest.approx(0.2), pytest.approx(0.3)]
+    # Rounding the ROW never feeds back into the carry.
+    assert cumulative != 0.3  # raw float accumulation, not rounded per step
+    assert cumulative == pytest.approx(0.3)
+
+
+def test_floor_hour_zeros_subhour_and_keeps_tz() -> None:
+    floored = _floor_hour(datetime(2026, 3, 4, 5, 6, 7, 8, tzinfo=_UTC))
+    assert floored == datetime(2026, 3, 4, 5, 0, tzinfo=_UTC)
+    assert floored.tzinfo is _UTC
+
+
+def test_floor_hour_preserves_fold() -> None:
+    helsinki = ZoneInfo("Europe/Helsinki")
+    dt = datetime(2025, 10, 26, 3, 30, tzinfo=helsinki, fold=1)
+    floored = _floor_hour(dt)
+    assert floored.fold == 1
+    assert (floored.minute, floored.second, floored.microsecond) == (0, 0, 0)
+
+
+def test_floor_hour_idempotent() -> None:
+    dt = datetime(2026, 1, 1, 12, 34, 56, tzinfo=_UTC)
+    once = _floor_hour(dt)
+    assert _floor_hour(once) == once
+
+
+async def test_bucket_last_wins_and_preserves_none() -> None:
+    manager = _manager()
+    await manager._ensure_helsinki_tz()
+    series = [
+        _raw_entry("2026-01-15T10:00:00+02:00", 1.0),  # 08:00Z
+        _raw_entry("2026-01-15T10:30:00+02:00", 2.0),  # same 08:00Z bucket
+        _raw_entry("2026-01-15T11:00:00+02:00", None),  # 09:00Z, None kept
+    ]
+
+    buckets = manager._bucket_series_by_utc_hour(series)
+
+    assert buckets[datetime(2026, 1, 15, 8, 0, tzinfo=_UTC)] == pytest.approx(2.0)
+    assert buckets[datetime(2026, 1, 15, 9, 0, tzinfo=_UTC)] is None
+
+
+async def test_bucket_aware_and_naive_helsinki_to_utc() -> None:
+    manager = _manager()
+    await manager._ensure_helsinki_tz()
+    series = [
+        _raw_entry("2026-01-15T10:00:00+02:00", 1.5),  # aware winter -> 08:00Z
+        _raw_entry("2026-07-15T10:00:00", 2.5),  # naive Helsinki summer -> 07:00Z
+    ]
+
+    buckets = manager._bucket_series_by_utc_hour(series)
+
+    assert buckets[datetime(2026, 1, 15, 8, 0, tzinfo=_UTC)] == pytest.approx(1.5)
+    assert buckets[datetime(2026, 7, 15, 7, 0, tzinfo=_UTC)] == pytest.approx(2.5)
