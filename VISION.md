@@ -37,6 +37,9 @@ Dashboard consumes directly. Correct, low-maintenance, and boring.
 - A background poll (default every 3 h) that extends the statistics chain.
 - A technical backfill action (Home Assistant Developer Tools → Actions) that
   imports or repairs a bounded historical range for a chosen delivery site.
+- A read-only diagnostics download (Home Assistant's standard integration
+  diagnostics) with credentials and delivery-site id redacted, for locally
+  debugging a stalled import.
 - Output: one external statistic per config entry, `kWh`, `has_sum`, ready for
   the Energy Dashboard.
 
