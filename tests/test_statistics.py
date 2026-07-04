@@ -14,6 +14,7 @@ query so the chain arithmetic is exercised without a live HA database.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import date, datetime, timedelta
 from types import SimpleNamespace
@@ -26,6 +27,7 @@ from homeassistant.exceptions import HomeAssistantError
 from custom_components.helen_energy_consumption.statistics import (
     HelenConsumptionStatistics,
     StatisticsQueryError,
+    _chain_lock,
 )
 
 _UTC = ZoneInfo("UTC")
@@ -46,6 +48,13 @@ def _entry(offset: int, electricity: float | None) -> SimpleNamespace:
 def _manager() -> HelenConsumptionStatistics:
     """Build a statistics manager with mocked HA and API dependencies."""
     return HelenConsumptionStatistics(MagicMock(), MagicMock(), "12345678", "Helen")
+
+
+def _manager_for(delivery_site_id: str) -> HelenConsumptionStatistics:
+    """Build a manager keyed on delivery_site_id (its shared chain lock)."""
+    return HelenConsumptionStatistics(
+        MagicMock(), MagicMock(), delivery_site_id, "Helen"
+    )
 
 
 async def test_transient_read_error_does_not_rewrite_from_zero() -> None:
@@ -108,6 +117,7 @@ async def test_repaired_delta_keeps_chain_continuous_at_boundary() -> None:
     manager._import_statistics = _capture
 
     recorder = MagicMock()
+    recorder.async_block_till_done = AsyncMock()  # GUARD #2 flush after repairs
     series = [_entry(0, 1.0), _entry(1, 1.0), _entry(2, 0.5), _entry(3, 0.3)]
 
     with patch(f"{_STATS_MODULE}.get_instance", return_value=recorder):
@@ -148,6 +158,7 @@ async def _run_poll(
 
     manager._import_statistics = _capture
     rec = recorder or MagicMock()
+    rec.async_block_till_done = AsyncMock()  # GUARD #2 flush after repairs
     with patch(f"{_STATS_MODULE}.get_instance", return_value=rec):
         await manager._write_statistics_chain(series)
     return captured.get("stats"), rec
@@ -168,6 +179,8 @@ async def test_missing_interior_hour_flat_filled_this_poll() -> None:
     assert existing[_hour(1)] <= rows[_hour(2)] <= existing[_hour(3)]
     # The gap hour is not adjusted this poll (deferred to the next poll).
     recorder.async_adjust_statistics.assert_not_called()
+    # No repair -> no recorder flush (GUARD #2 flush is scoped to repair cycles).
+    recorder.async_block_till_done.assert_not_called()
 
 
 async def test_missing_interior_hour_converges_next_poll() -> None:
@@ -184,6 +197,8 @@ async def test_missing_interior_hour_converges_next_poll() -> None:
     recorder.async_adjust_statistics.assert_called_once_with(
         manager.consumption_statistic_id, _hour(2), 0.6, "kWh"
     )
+    # A repair was applied -> the GUARD #2 flush runs before releasing the lock.
+    recorder.async_block_till_done.assert_awaited_once()
     # New tail hour anchors on existing[H3] + repaired_delta (2.0 + 0.6), so the
     # appended H4 is 2.6 + 0.3 = 2.9 — the repaired energy is not lost.
     assert stats is not None
@@ -509,3 +524,231 @@ async def test_rebuild_empty_response_writes_nothing() -> None:
         await manager.rebuild_range(start_date)
 
     manager._import_statistics.assert_not_called()
+
+
+# --- shared per-chain write lock (issue #18) --------------------------------
+
+
+class _FakeRecorder:
+    """Model HA's queued-write / separate-read-thread behaviour for repairs.
+
+    async_adjust_statistics enqueues a non-idempotent `sum += adj` but does NOT
+    apply it; async_block_till_done (the GUARD #2 flush) applies the queue. Reads
+    go through the manager's mocked _get_existing_statistics_in_window against
+    `db`, so a reader only observes applied (flushed) adjustments.
+    """
+
+    def __init__(self, db: dict[datetime, float]) -> None:
+        self.db = db
+        self._pending: list[tuple[datetime, float]] = []
+        self.adjust_calls: list[tuple[datetime, float]] = []
+
+    def async_adjust_statistics(
+        self, statistic_id: str, start: datetime, adj: float, unit: str
+    ) -> None:
+        self.adjust_calls.append((start, adj))
+        self._pending.append((start, adj))  # queued, not yet applied
+
+    async def async_block_till_done(self) -> None:
+        for start, adj in self._pending:
+            for hour in self.db:
+                if hour >= start:  # adjust cascades forward
+                    self.db[hour] += adj
+        self._pending.clear()
+
+
+def _db_reader(recorder: _FakeRecorder):
+    """A _get_existing_statistics_in_window stand-in reading applied DB state."""
+
+    async def _read(statistic_id: str, start: datetime, end: datetime | None) -> dict:
+        return dict(recorder.db)
+
+    return _read
+
+
+async def test_reload_repair_applied_exactly_once() -> None:
+    """GUARD #2: a repaired hour is adjusted once across two same-chain cycles.
+
+    Models the reload case (two coordinators, one chain). Without the post-repair
+    flush the second cycle reads the stale, still-flat chain and re-enqueues the
+    same +delta -> a permanent double-count.
+    """
+    db = {_hour(0): 1.0, _hour(1): 1.0, _hour(2): 2.0}  # H1 zero-filled (flat)
+    recorder = _FakeRecorder(db)
+    old = _manager_for("reload-site")
+    new = _manager_for("reload-site")  # same delivery_site_id -> same chain lock
+    for mgr in (old, new):
+        mgr._get_existing_statistics_in_window = _db_reader(recorder)
+        mgr._import_statistics = AsyncMock()
+
+    series = [_entry(0, 1.0), _entry(1, 0.5), _entry(2, 1.0)]  # H1 now has data
+    with patch(f"{_STATS_MODULE}.get_instance", return_value=recorder):
+        await old._write_statistics_chain(series)
+        await new._write_statistics_chain(series)
+
+    h1_adjusts = [call for call in recorder.adjust_calls if call[0] == _hour(1)]
+    assert len(h1_adjusts) == 1
+
+
+async def test_same_statistic_id_serializes() -> None:
+    """A second writer of the same chain waits for the first to release."""
+    first = _manager_for("serialize-site")
+    second = _manager_for("serialize-site")
+    await first._ensure_helsinki_tz()
+    await second._ensure_helsinki_tz()
+
+    first_inside = asyncio.Event()
+    release = asyncio.Event()
+    second_read = asyncio.Event()
+
+    async def _first_read(*_args) -> dict:
+        first_inside.set()
+        await release.wait()  # hold the chain lock
+        return {}
+
+    first._get_existing_statistics_in_window = _first_read
+    first._import_statistics = AsyncMock()
+
+    async def _second_read(*_args) -> dict:
+        second_read.set()
+        return {}
+
+    second._get_existing_statistics_in_window = _second_read
+    second._import_statistics = AsyncMock()
+
+    series = [_entry(0, 1.0)]
+    with patch(f"{_STATS_MODULE}.get_instance", return_value=MagicMock()):
+        task_first = asyncio.create_task(first._write_statistics_chain(series))
+        await first_inside.wait()  # first holds the chain lock
+
+        task_second = asyncio.create_task(second._write_statistics_chain(series))
+        await asyncio.sleep(0)
+        assert not second_read.is_set()  # blocked on the shared lock
+        assert _chain_lock(first.consumption_statistic_id).locked()
+
+        release.set()
+        await task_first
+        await task_second
+        assert second_read.is_set()  # proceeded once the first released
+
+
+async def test_different_statistic_ids_do_not_block() -> None:
+    """A writer of a different chain is not blocked by another chain's holder."""
+    blocker = _manager_for("site-x")
+    other = _manager_for("site-y")
+    await blocker._ensure_helsinki_tz()
+    await other._ensure_helsinki_tz()
+
+    blocker_inside = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _blocker_read(*_args) -> dict:
+        blocker_inside.set()
+        await release.wait()
+        return {}
+
+    blocker._get_existing_statistics_in_window = _blocker_read
+    blocker._import_statistics = AsyncMock()
+    other._get_existing_statistics_in_window = AsyncMock(return_value={})
+    other._import_statistics = AsyncMock()
+
+    series = [_entry(0, 1.0)]
+    with patch(f"{_STATS_MODULE}.get_instance", return_value=MagicMock()):
+        task_blocker = asyncio.create_task(blocker._write_statistics_chain(series))
+        await blocker_inside.wait()
+
+        # Different chain lock -> runs to completion without waiting.
+        await other._write_statistics_chain(series)
+        other._import_statistics.assert_awaited_once()
+
+        release.set()
+        await task_blocker
+
+
+async def test_backfill_and_poll_serialize_on_same_chain() -> None:
+    """rebuild_range and a poll of the same chain contend the same lock."""
+    backfiller = _manager_for("shared-site")
+    poller = _manager_for("shared-site")
+    await backfiller._ensure_helsinki_tz()
+    await poller._ensure_helsinki_tz()
+
+    backfill_inside = asyncio.Event()
+    release = asyncio.Event()
+    poll_read = asyncio.Event()
+
+    async def _backfill_read(*_args) -> dict:
+        backfill_inside.set()
+        await release.wait()  # hold the chain lock inside rebuild_range
+        return {}
+
+    backfiller._fetch_range_data = AsyncMock(return_value=[_entry(0, 1.0)])
+    backfiller._get_existing_statistics_in_window = _backfill_read
+    backfiller._get_anchor_sum = AsyncMock(return_value=0.0)
+    backfiller._import_statistics = AsyncMock()
+
+    async def _poll_read(*_args) -> dict:
+        poll_read.set()
+        return {}
+
+    poller._get_existing_statistics_in_window = _poll_read
+    poller._import_statistics = AsyncMock()
+
+    with patch(f"{_STATS_MODULE}.get_instance", return_value=MagicMock()):
+        task_backfill = asyncio.create_task(backfiller.rebuild_range(date(2026, 1, 15)))
+        await backfill_inside.wait()
+
+        task_poll = asyncio.create_task(
+            poller._write_statistics_chain([_entry(0, 1.0)])
+        )
+        await asyncio.sleep(0)
+        assert not poll_read.is_set()  # poll blocked on the shared chain lock
+
+        release.set()
+        await task_backfill
+        await task_poll
+        assert poll_read.is_set()
+
+
+async def test_chain_lock_released_on_query_error() -> None:
+    """A StatisticsQueryError early-return releases the lock for the next writer."""
+    first = _manager_for("err-site")
+    second = _manager_for("err-site")
+    first._get_existing_statistics_in_window = AsyncMock(
+        side_effect=StatisticsQueryError("boom")
+    )
+    first._import_statistics = AsyncMock()
+    second._get_existing_statistics_in_window = AsyncMock(return_value={})
+    second._import_statistics = AsyncMock()
+
+    series = [_entry(0, 1.0)]
+    with patch(f"{_STATS_MODULE}.get_instance", return_value=MagicMock()):
+        await first._write_statistics_chain(series)  # returns; no wedge
+        await second._write_statistics_chain(series)
+
+    second._import_statistics.assert_awaited_once()
+    assert not _chain_lock(first.consumption_statistic_id).locked()
+
+
+async def test_chain_lock_released_on_exception() -> None:
+    """An exception inside the critical section still releases the lock."""
+    first = _manager_for("raise-site")
+    second = _manager_for("raise-site")
+    first._get_existing_statistics_in_window = AsyncMock(return_value={})
+    first._import_statistics = AsyncMock(side_effect=RuntimeError("write failed"))
+    second._get_existing_statistics_in_window = AsyncMock(return_value={})
+    second._import_statistics = AsyncMock()
+
+    series = [_entry(0, 1.0)]
+    with patch(f"{_STATS_MODULE}.get_instance", return_value=MagicMock()):
+        with pytest.raises(RuntimeError):
+            await first._write_statistics_chain(series)
+        await second._write_statistics_chain(series)
+
+    second._import_statistics.assert_awaited_once()
+    assert not _chain_lock(second.consumption_statistic_id).locked()
+
+
+def test_chain_lock_identity() -> None:
+    """_chain_lock returns one shared lock per id, distinct across ids."""
+    assert _chain_lock("id-a") is _chain_lock("id-a")
+    assert _chain_lock("id-a") is not _chain_lock("id-b")
