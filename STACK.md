@@ -136,7 +136,7 @@ Default answer to "should we add a library?" is **no** — prefer stdlib or HA c
 | `pytest-homeassistant-custom-component` | `>=0.13.205,<0.14`     | Standard custom-component test fixtures, aligned to HA 2025.1   |
 | `pytest`                                | `>=8.3,<9`             | Test runner                                                     |
 | `ruff`                                  | `==0.15.20`            | Lint + format gate — exact-pinned; output can shift per release |
-| `mypy`                                  | stable, explicit bound | Strict type-checking gate (**to be added**, see §3)             |
+| `mypy`                                  | `>=2.1,<2.2`           | Strict type-checking gate                                       |
 | `freezegun`                             | stable, explicit bound | Deterministic time in tests (**to be added when needed**)       |
 | `oma-helen-cli`                         | `==1.8.0`              | Mirrors the manifest pin so the component imports in tests      |
 
