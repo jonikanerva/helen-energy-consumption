@@ -34,8 +34,8 @@ VISION.md / CLAUDE.md / STACK.md
 ```
 
 - **Package boundaries (enforced by discipline; add lint rules if they start to blur):**
-  - `statistics.py` and any pure-logic helper compute over **decoded** consumption data, never raw payloads. Helen-API access is confined to `coordinator.py` via the `helenservice` client.
-  - `coordinator.py` is the only owner of the Helen client session and the only place that logs in, selects the delivery site, and drives imports.
+  - `statistics.py` and any pure-logic helper compute over **decoded** consumption data, never raw payloads. Helen client **construction and session ownership** is confined to `coordinator.py`; the fetch helpers in `statistics.py` call Helen only through the client the coordinator hands them and never construct one.
+  - `coordinator.py` is the only owner of the long-lived Helen client session and the only place that drives login, delivery-site selection, and imports on it. `config_flow.py` builds a short-lived client solely for config-flow boundary validation (credential check and delivery-site discovery/selection, as HA's config-flow rules require) and closes it before the entry is created.
   - `__init__.py` wires; it holds no business rules beyond target-entry resolution for the admin action.
   - `const.py` holds constants only — no logic.
 
@@ -88,11 +88,9 @@ Bootstrap with `mise install` before running anything below. `.mise.toml` (verif
 | `$LINT_CMD`   | `uv run ruff check custom_components tests && uv run mypy custom_components`                     |
 | `$BUILD_CMD`  | `uv run python -m compileall -q custom_components` (syntax gate — Python has no compile step)    |
 | `$TEST_CMD`   | `uv run pytest tests/`                                                                           |
-| `$VERIFY_CMD` | `mise run verify` — ruff check → ruff format --check → mypy → pytest, failing on the first error |
+| `$VERIFY_CMD` | `mise run verify` — uv sync --frozen → ruff check → ruff format --check → mypy → pytest, failing on the first error |
 
 > The ecosystem's structural gates — `hassfest` and HACS validation — cannot run locally in a custom-integration repo (`script.hassfest` lives in the Home Assistant core repository), so they run in CI as the `home-assistant/actions/hassfest` and `hacs/action` GitHub Actions. `$VERIFY_CMD` is what any change must pass before claiming completion; a PR must additionally pass the hassfest and HACS-validate actions.
->
-> **Follow-up to make this fully real:** add `mypy` to the `dev` dependency group with a `[tool.mypy]` strict config in `pyproject.toml`, add the `uv run mypy custom_components` step to `[tasks.verify]` in `.mise.toml`, and add the `.github/workflows/` CI running `$VERIFY_CMD` + hassfest + HACS validation. Until the code is mypy-clean, expect type-tightening fixes.
 
 ---
 
@@ -138,7 +136,7 @@ Default answer to "should we add a library?" is **no** — prefer stdlib or HA c
 | `pytest-homeassistant-custom-component` | `>=0.13.205,<0.14`     | Standard custom-component test fixtures, aligned to HA 2025.1   |
 | `pytest`                                | `>=8.3,<9`             | Test runner                                                     |
 | `ruff`                                  | `==0.15.20`            | Lint + format gate — exact-pinned; output can shift per release |
-| `mypy`                                  | stable, explicit bound | Strict type-checking gate (**to be added**, see §3)             |
+| `mypy`                                  | `>=2.1,<2.2`           | Strict type-checking gate                                       |
 | `freezegun`                             | stable, explicit bound | Deterministic time in tests (**to be added when needed**)       |
 | `oma-helen-cli`                         | `==1.8.0`              | Mirrors the manifest pin so the component imports in tests      |
 
@@ -225,3 +223,5 @@ Deliberate departures from Home Assistant's standard integration patterns, with 
 | ---------- | -------------------------------------------------------- | ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 2026-07-04 | `DataUpdateCoordinator[T]` as the polling/data seam      | Thin custom `HelenConsumptionCoordinator` driven by `async_track_time_interval` | There are no entities; `DataUpdateCoordinator`'s value is fanning typed data out to `CoordinatorEntity` subscribers. Revisit if entities are ever added.                                        |
 | 2026-07-04 | Async upstream client using the shared `aiohttp` session | Synchronous `helenservice` client, every call routed through the executor       | `oma-helen-cli` is the only maintained Helen library and it is sync. The client owns its own session (opened/closed per update). Prefer pushing an async client upstream over wrapping locally. |
+| 2026-07-04 | Module-level mutable state for per-entry data is banned (§7) — per-entry state lives on `entry.runtime_data` | `statistics.py` keeps a module-level `_CHAIN_LOCKS` registry, one `asyncio.Lock` per `statistic_id` | Serializes chain writes across a config-entry reload, when the old and new coordinator instances briefly coexist and write the same chain (#18); `runtime_data` cannot span instances across a reload. This is per-`statistic_id` cross-reload coordination, not per-entry data. Revisit a typed `HassKey` in `hass.data` if the cosmetic warts (never-pruned dict, test reset in `tests/conftest.py`) ever grow beyond cosmetic. |
+| 2026-07-04 | Every Helen client call runs via `hass.async_add_executor_job` (§0, §4) | `coordinator.close` — the sync `entry.async_on_unload` teardown callback — calls the client's `close()` on the event loop; the setup-failure paths in `__init__.py` reuse it | `close()` is near-instant local session teardown with no network round-trip, and executor-routing it would rework the teardown wiring §9 says to keep. All poll, backfill, and re-login closes are executor-routed (#31 / PR #39). Revisit if the upstream client's `close()` ever grows real I/O. |
