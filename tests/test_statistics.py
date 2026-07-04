@@ -107,6 +107,30 @@ async def test_query_error_propagates_as_sentinel() -> None:
         )
 
 
+async def test_present_but_none_sum_skips_poll_and_writes_nothing() -> None:
+    """A row whose sum is present but None aborts the poll, never anchors 0.0.
+
+    For our has_sum stream a None sum can only mean another writer or DB
+    corruption; anchoring on 0.0 would re-base the cumulative chain (a meter
+    reset in the Energy Dashboard). The read raises StatisticsQueryError and
+    the caller's existing handling skips the poll (ruling in issue #32).
+    """
+    manager = _manager()
+    manager._import_statistics = AsyncMock()
+    stat_id = manager.consumption_statistic_id
+
+    rows = [{"start": _hour(0).timestamp(), "sum": None}]
+    recorder = MagicMock()
+    recorder.async_add_executor_job = AsyncMock(return_value={stat_id: rows})
+
+    series = [_entry(0, 1.0), _entry(1, 1.0)]
+    with patch(f"{_STATS_MODULE}.get_instance", return_value=recorder):
+        # Must not raise (poll skipped) and must not write anything.
+        await manager._write_statistics_chain(series)
+
+    manager._import_statistics.assert_not_called()
+
+
 async def test_repaired_delta_keeps_chain_continuous_at_boundary() -> None:
     """Repairing a zero-filled hour must not drop energy at the append boundary.
 

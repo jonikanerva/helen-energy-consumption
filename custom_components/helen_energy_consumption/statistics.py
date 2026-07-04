@@ -12,6 +12,7 @@ import asyncio
 import logging
 import re
 from datetime import date, datetime, time, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from helenservice.api_client import HelenApiClient
@@ -28,7 +29,12 @@ from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 # Forward-compat: StatisticMeanType is the metadata API on HA > 2025.1;
 # has_mean=False is the 2025.1 fallback.
 try:
-    from homeassistant.components.recorder.models import StatisticMeanType
+    # reason: StatisticMeanType was added after HA 2025.1; the ImportError
+    # branch below is the 2025.1 path, so the attribute genuinely may not
+    # exist on the pinned dev environment.
+    from homeassistant.components.recorder.models import (  # type: ignore[attr-defined]
+        StatisticMeanType,
+    )
 
     HAS_MEAN_TYPE = True
 except ImportError:
@@ -65,7 +71,7 @@ def _chain_lock(statistic_id: str) -> asyncio.Lock:
 
 
 class StatisticsQueryError(Exception):
-    """Raised when the recorder query for existing statistics fails.
+    """Raised when the recorder query fails or a row's sum is unreadable.
 
     Signals the caller to skip this poll rather than treat the error as an
     empty database and rewrite history from zero (VISION principle 5).
@@ -95,6 +101,17 @@ def _safe_round(value: float | None, decimals: int = 3) -> float:
 def _floor_hour(dt: datetime) -> datetime:
     """Floor a datetime to the top of its hour, preserving tzinfo and fold."""
     return dt.replace(minute=0, second=0, microsecond=0)
+
+
+def _row_start_to_utc(raw: float | datetime) -> datetime:
+    """Normalize a recorder row start (epoch float or datetime) to aware UTC."""
+    if isinstance(raw, datetime):
+        return (
+            raw.replace(tzinfo=dt_util.UTC)
+            if raw.tzinfo is None
+            else raw.astimezone(dt_util.UTC)
+        )
+    return dt_util.utc_from_timestamp(raw)
 
 
 def _accumulate_row(
@@ -199,12 +216,13 @@ class HelenConsumptionStatistics:
                 return []
             raise
 
-        _LOGGER.debug("Received %d hourly intervals", len(response.series))
+        series: list[MeasurementsWithSpotPriceSeries] = response.series
+        _LOGGER.debug("Received %d hourly intervals", len(series))
         if response.missing_series:
             _LOGGER.debug(
                 "API reported %d missing hourly intervals", len(response.missing_series)
             )
-        return response.series
+        return series
 
     async def _write_statistics_chain(
         self, series: list[MeasurementsWithSpotPriceSeries]
@@ -556,17 +574,19 @@ class HelenConsumptionStatistics:
 
         existing: dict[datetime, float] = {}
         for stat in stats.get(statistic_id, []):
-            raw = stat["start"]
-            if isinstance(raw, datetime):
-                ts = (
-                    raw.replace(tzinfo=dt_util.UTC)
-                    if raw.tzinfo is None
-                    else raw.astimezone(dt_util.UTC)
+            ts = _floor_hour(_row_start_to_utc(stat["start"]))
+            row_sum = stat.get("sum", 0.0)
+            if row_sum is None:
+                # A present-but-None sum for our has_sum stream can only mean
+                # another writer or DB corruption — anchoring on 0.0 would
+                # re-base the cumulative chain (a meter reset in the Energy
+                # Dashboard). Fail the read instead; ruling in issue #32. A
+                # row missing the key keeps the long-standing 0.0 default.
+                raise StatisticsQueryError(
+                    f"Statistics row for {statistic_id} at {ts.isoformat()} "
+                    "has no readable sum"
                 )
-            else:
-                ts = dt_util.utc_from_timestamp(raw)
-            ts = _floor_hour(ts)
-            existing[ts] = stat.get("sum", 0.0)
+            existing[ts] = row_sum
         return existing
 
     async def _ensure_helsinki_tz(self) -> None:
@@ -646,7 +666,9 @@ class HelenConsumptionStatistics:
 
     async def _import_statistics(self, statistics: list[StatisticData]) -> None:
         """Write the cumulative consumption stream into the HA database."""
-        metadata_kwargs = {
+        # reason: carries forward-compat keys (unit_class, mean_type) absent
+        # from HA 2025.1's StatisticMetaData.
+        metadata_kwargs: dict[str, Any] = {
             "has_sum": True,
             "name": f"{self.name} - Consumption",
             "source": DOMAIN,
@@ -659,5 +681,7 @@ class HelenConsumptionStatistics:
         else:
             metadata_kwargs["has_mean"] = False
 
-        metadata = StatisticMetaData(**metadata_kwargs)
+        # reason: 2025.1's TypedDict predates mean_type; keys are version-gated
+        # above and both branches are test-covered.
+        metadata = StatisticMetaData(**metadata_kwargs)  # type: ignore[typeddict-item]
         async_add_external_statistics(self.hass, metadata, statistics)
