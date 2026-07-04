@@ -50,3 +50,7 @@ custom_components/helen_energy_consumption/
 ├── statistics.py     # fetch consumption, write external statistic
 └── translations/en.json
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
