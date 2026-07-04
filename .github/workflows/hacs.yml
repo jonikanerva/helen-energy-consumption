@@ -1,0 +1,25 @@
+name: HACS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  hacs:
+    runs-on: ubuntu-latest
+    steps:
+      # No checkout step: hacs/action fetches the repository itself
+      # (per https://hacs.xyz/docs/publish/action/).
+      - uses: hacs/action@main
+        with:
+          category: integration
+          # helen_energy_consumption is not in home-assistant/brands, so the
+          # default brands check fails. Submit-to-brands vs keep-ignoring is
+          # tracked in issue #33 (decide before closing it).
+          ignore: brands
