@@ -582,6 +582,12 @@ class HelenConsumptionStatistics:
                 # re-base the cumulative chain (a meter reset in the Energy
                 # Dashboard). Fail the read instead; ruling in issue #32. A
                 # row missing the key keeps the long-standing 0.0 default.
+                _LOGGER.warning(
+                    "Statistics row for %s at %s has no readable sum; "
+                    "skipping poll to preserve history",
+                    statistic_id,
+                    ts.isoformat(),
+                )
                 raise StatisticsQueryError(
                     f"Statistics row for {statistic_id} at {ts.isoformat()} "
                     "has no readable sum"
