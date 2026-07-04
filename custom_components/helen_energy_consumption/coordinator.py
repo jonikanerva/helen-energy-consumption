@@ -10,13 +10,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import date
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 from helenservice.api_client import HelenApiClient
 from helenservice.api_exceptions import (
     HelenAuthenticationException,
     InvalidApiResponseException,
 )
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
     HomeAssistantError,
@@ -26,10 +27,23 @@ from homeassistant.exceptions import (
 from .statistics import HelenConsumptionStatistics
 
 if TYPE_CHECKING:
-    from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class HelenCredentials(TypedDict):
+    """Oma Helen login credentials, splatted into login_and_init."""
+
+    username: str
+    password: str
+
+
+# Types entry.runtime_data as the coordinator at the setup/service boundary.
+# ConfigEntry is imported at runtime (not under TYPE_CHECKING): the PEP 695
+# alias body evaluates lazily, so a type-checking-only name inside it would be
+# a latent NameError at the first runtime resolution.
+type HelenConfigEntry = ConfigEntry[HelenConsumptionCoordinator]
 
 
 class HelenConsumptionCoordinator:
@@ -38,8 +52,8 @@ class HelenConsumptionCoordinator:
     def __init__(
         self,
         hass: HomeAssistant,
-        entry: ConfigEntry,
-        credentials: dict[str, str],
+        entry: HelenConfigEntry,
+        credentials: HelenCredentials,
         delivery_site_id: str,
     ) -> None:
         """Initialize the coordinator and its statistics manager."""

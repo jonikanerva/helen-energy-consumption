@@ -8,12 +8,12 @@ Energy Dashboard. No entities, no cost tracking — consumption only.
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, datetime
 from typing import TYPE_CHECKING
 
 import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
-from homeassistant.config_entries import ConfigEntry, ConfigEntryState
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
@@ -31,16 +31,13 @@ from .const import (
     SCAN_INTERVAL,
     SERVICE_BACKFILL,
 )
-from .coordinator import HelenConsumptionCoordinator
+from .coordinator import HelenConfigEntry, HelenConsumptionCoordinator
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant, ServiceCall
+    from homeassistant.helpers.typing import ConfigType
 
 _LOGGER = logging.getLogger(__name__)
-
-# Types entry.runtime_data as the coordinator at the setup/service boundary
-# (documentary — ruff does not type-check). No runtime effect.
-type HelenConfigEntry = ConfigEntry[HelenConsumptionCoordinator]
 
 _BACKFILL_SCHEMA = vol.Schema(
     {
@@ -80,7 +77,7 @@ def _resolve_target_entry(
     return loaded[0]
 
 
-async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Register the backfill admin action once for the integration."""
 
     async def _handle_backfill(call: ServiceCall) -> None:
@@ -124,7 +121,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HelenConfigEntry) -> boo
         ) from err
 
     # There are no entities to drive a DataUpdateCoordinator, so poll on a timer.
-    async def _scheduled_update(_now) -> None:
+    async def _scheduled_update(_now: datetime) -> None:
         try:
             await coordinator.async_update()
         except ConfigEntryAuthFailed:

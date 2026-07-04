@@ -18,7 +18,7 @@ from homeassistant.helpers import selector
 from .const import CONF_DELIVERY_SITE_ID, DOMAIN
 
 if TYPE_CHECKING:
-    from homeassistant.data_entry_flow import FlowResult
+    from homeassistant.config_entries import ConfigFlowResult
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -31,6 +31,7 @@ class SiteInfo(NamedTuple):
     address: str | None
 
 
+# reason: raw helenservice contract JSON, shape unmodelled upstream
 def _extract_address(delivery_site: dict[str, Any]) -> str | None:
     """Return the street address for a delivery site, or None on any anomaly.
 
@@ -42,7 +43,8 @@ def _extract_address(delivery_site: dict[str, Any]) -> str | None:
         address = delivery_site.get("address") or {}
         street = address.get("street_address")
         return str(street) if street else None
-    except Exception:  # noqa: BLE001 - address is best-effort, never fatal
+    except Exception as err:  # address is best-effort, never fatal
+        _LOGGER.debug("Ignoring malformed delivery-site address: %s", err)
         return None
 
 
@@ -61,6 +63,7 @@ class HelenConsumptionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         """Initialize the config flow."""
         self.api_client: HelenApiClient | None = None
+        # reason: stores the HA step's user_input as received
         self._user_input: dict[str, Any] | None = None
         self._sites: list[SiteInfo] = []
 
@@ -97,6 +100,8 @@ class HelenConsumptionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         active contracts); gsrn and address are read from
         `get_contract_data_json()`.
         """
+        # Invariant: only reached after _authenticate set api_client.
+        assert self.api_client is not None
         site_ids = [str(s) for s in self.api_client.get_all_delivery_site_ids()]
         contracts = self.api_client.get_contract_data_json()
 
@@ -120,9 +125,10 @@ class HelenConsumptionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             sites.append(by_id.get(sid) or SiteInfo(sid, sid, None))
         return sites
 
+    # reason: HA's canonical config-flow step signature
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the initial credentials step."""
         errors: dict[str, str] = {}
 
@@ -141,7 +147,7 @@ class HelenConsumptionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 ConnectionError,
             ) as ex:
                 errors = self._handle_error(ex)
-            except Exception:  # noqa: BLE001 - surfaced as cannot_connect
+            except Exception:  # surfaced as cannot_connect
                 errors = {"base": "cannot_connect"}
             else:
                 _LOGGER.debug(
@@ -166,13 +172,17 @@ class HelenConsumptionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
+    # reason: HA's canonical config-flow step signature
     async def async_step_select_site(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Let the user pick a delivery site when the account has several."""
         if user_input is not None:
             chosen = user_input[CONF_DELIVERY_SITE_ID]
             info = next((s for s in self._sites if s.site_id == chosen), None)
+            # Invariant: this step only follows async_step_user's successful
+            # _authenticate, so the client is set.
+            assert self.api_client is not None
             try:
                 await self.hass.async_add_executor_job(
                     self.api_client.select_delivery_site_if_valid_id, chosen
@@ -201,14 +211,17 @@ class HelenConsumptionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             )
                             for s in self._sites
                         ],
-                        mode="dropdown",
+                        mode=selector.SelectSelectorMode.DROPDOWN,
                     )
                 )
             }
         )
 
-    async def _create_entry(self, site: SiteInfo) -> FlowResult:
+    async def _create_entry(self, site: SiteInfo) -> ConfigFlowResult:
         """Create the config entry for the chosen delivery site."""
+        # Invariant: every path here passed through async_step_user, which set
+        # _user_input before routing on the collected sites.
+        assert self._user_input is not None
         username = self._user_input[CONF_USERNAME]
         unique_id = f"{username.lower()}_{site.site_id}"
 
@@ -228,13 +241,15 @@ class HelenConsumptionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             },
         )
 
-    async def async_step_reauth(self, _entry_data: dict[str, Any]) -> FlowResult:
+    # reason: HA's canonical config-flow step signature
+    async def async_step_reauth(self, _entry_data: dict[str, Any]) -> ConfigFlowResult:
         """Handle re-authentication when the stored token is invalid."""
         return await self.async_step_reauth_confirm()
 
+    # reason: HA's canonical config-flow step signature
     async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Ask for a new password and update the entry."""
         errors: dict[str, str] = {}
 
@@ -256,7 +271,7 @@ class HelenConsumptionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 ConnectionError,
             ) as ex:
                 errors = self._handle_error(ex)
-            except Exception:  # noqa: BLE001 - surfaced as cannot_connect
+            except Exception:  # surfaced as cannot_connect
                 errors = {"base": "cannot_connect"}
             finally:
                 await self._cleanup()
