@@ -23,6 +23,7 @@ custom_components/helen_energy_consumption/
   config_flow.py       # boundary: username/password/delivery_site_id, voluptuous-validated
   coordinator.py       # HelenConsumptionCoordinator — thin, timer-driven (see §11)
   statistics.py        # HelenConsumptionStatistics — recorder external-statistics import/repair
+  diagnostics.py       # redacted config-entry diagnostics (§8 TO_REDACT)
   services.yaml        # backfill admin action schema (UI)
   translations/en.json
 tests/                 # pytest + pytest-homeassistant-custom-component
@@ -69,7 +70,7 @@ VISION.md / CLAUDE.md / STACK.md
 | Upstream API wrapper   | `oma-helen-cli` (`helenservice`) — the sole runtime dependency, pinned exactly in `manifest.json`                     | All Helen auth/endpoint logic lives upstream; push fixes there                                 |
 | Admin action           | `async_register_admin_service` — user-triggered bounded backfill                                                      | `ServiceValidationError` for out-of-range input                                                |
 | Logging                | stdlib `logging` — `_LOGGER = logging.getLogger(__name__)`                                                            | No `print()`; credentials/full responses never logged (see §8)                                 |
-| Diagnostics            | `homeassistant.components.diagnostics` + `async_redact_data` — **planned, not yet present**                           | Add `diagnostics.py` redacting username/password/delivery_site_id                              |
+| Diagnostics            | `homeassistant.components.diagnostics` + `async_redact_data`                                                          | `diagnostics.py` redacts username/password/delivery_site_id                                    |
 | Testing                | `pytest` + `pytest-homeassistant-custom-component` (`asyncio_mode = auto`)                                            | Pinned to the HA 2025.1 series                                                                 |
 | Time in tests          | `freezegun` / HA's `async_fire_time_changed`                                                                          | Deterministic — no wall-clock sleeps                                                           |
 | Lint + format          | `ruff` (lint **and** format; `E`, `F`, `I`, `UP`, `B`), pinned exactly                                                | HA core's choice; replaces black/isort/flake8/pylint                                           |
@@ -187,7 +188,7 @@ General Python / Home Assistant:
 
   Translate `HelenAuthenticationException` / `InvalidApiResponseException` into this taxonomy at `coordinator.py` — never let a raw `helenservice` exception escape into HA.
 
-- **PII redaction:** credentials (`username`, `password`) and `delivery_site_id` are the sensitive fields. When `diagnostics.py` is added, route it through `async_redact_data` with an explicit `TO_REDACT` set; default to redacting unknown-sensitive fields rather than exposing them.
+- **PII redaction:** credentials (`username`, `password`) and `delivery_site_id` are the sensitive fields. `diagnostics.py` routes diagnostics through `async_redact_data` with an explicit `TO_REDACT` set; default to redacting unknown-sensitive fields rather than exposing them.
 - **Crash/telemetry reporting:** none. Home Assistant owns error reporting; no third-party analytics or crash reporters. The only outbound traffic is `oma-helen-cli` talking to Helen.
 
 ---
