@@ -18,7 +18,7 @@ from homeassistant.helpers import selector
 from .const import CONF_DELIVERY_SITE_ID, DOMAIN
 
 if TYPE_CHECKING:
-    from homeassistant.data_entry_flow import FlowResult
+    from homeassistant.config_entries import ConfigFlowResult
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -122,7 +122,7 @@ class HelenConsumptionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the initial credentials step."""
         errors: dict[str, str] = {}
 
@@ -168,7 +168,7 @@ class HelenConsumptionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_select_site(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Let the user pick a delivery site when the account has several."""
         if user_input is not None:
             chosen = user_input[CONF_DELIVERY_SITE_ID]
@@ -207,7 +207,7 @@ class HelenConsumptionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             }
         )
 
-    async def _create_entry(self, site: SiteInfo) -> FlowResult:
+    async def _create_entry(self, site: SiteInfo) -> ConfigFlowResult:
         """Create the config entry for the chosen delivery site."""
         username = self._user_input[CONF_USERNAME]
         unique_id = f"{username.lower()}_{site.site_id}"
@@ -228,13 +228,13 @@ class HelenConsumptionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             },
         )
 
-    async def async_step_reauth(self, _entry_data: dict[str, Any]) -> FlowResult:
+    async def async_step_reauth(self, _entry_data: dict[str, Any]) -> ConfigFlowResult:
         """Handle re-authentication when the stored token is invalid."""
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Ask for a new password and update the entry."""
         errors: dict[str, str] = {}
 
