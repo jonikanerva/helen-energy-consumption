@@ -8,6 +8,7 @@ scope — this integration only imports consumption.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import date, datetime, time, timedelta
@@ -45,6 +46,20 @@ _LOGGER = logging.getLogger(__name__)
 # Lower bound for the strict pre-start anchor read (statistics_during_period
 # requires a start_time; the Unix epoch is safely before any Helen data).
 _ANCHOR_READ_START = dt_util.utc_from_timestamp(0)
+
+# Chain writes are serialized per statistic_id, keyed independently of any
+# coordinator instance. On a config-entry reload the old and new coordinators
+# hold different per-instance locks (issue #7) but write the SAME chain, so an
+# in-flight old writer could interleave with the new one. This shared lock makes
+# all writers of a chain contend the same lock (issue #18). Created lazily on
+# the event loop; the poll's per-instance lock stays the OUTER lock (order is
+# always instance -> chain, never reversed).
+_CHAIN_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _chain_lock(statistic_id: str) -> asyncio.Lock:
+    """Return the shared write lock for a statistic_id (created on the loop)."""
+    return _CHAIN_LOCKS.setdefault(statistic_id, asyncio.Lock())
 
 
 class StatisticsQueryError(Exception):
@@ -207,78 +222,93 @@ class HelenConsumptionStatistics:
 
         now_utc = dt_util.utcnow().replace(minute=0, second=0, microsecond=0)
         window_end = now_utc + timedelta(hours=1)
-        try:
-            existing = await self._get_existing_statistics_in_window(
-                self.consumption_statistic_id, earliest_api, window_end
-            )
-        except StatisticsQueryError:
-            # History could not be read. Skip this poll; a later one retries.
-            return
 
-        # Repair previously zero-filled hours that now have real data. The
-        # repair cascades its positive delta forward through the DB, including
-        # last_db_hour, so anchor the forward walk on the repaired total to
-        # avoid dropping energy at the boundary.
-        repairs = await self._repair_zero_filled_hours(api_entries, existing)
-        repaired_delta = sum(delta for _, delta in repairs)
-
-        # Flat-fill fully-absent interior hours (gaps strictly between present
-        # rows). These carry post-repair sums (see _fill_missing_interior_hours)
-        # and sit below last_db_hour with zero delta, so they never touch the
-        # anchor; their real data lands on the next poll's repair pass.
-        missing_rows = self._fill_missing_interior_hours(existing, repairs)
-
-        if existing:
-            last_db_hour = max(existing.keys())
-            cumulative = existing[last_db_hour] + repaired_delta
-            walk_start = last_db_hour + timedelta(hours=1)
-        else:
-            cumulative = 0.0
-            walk_start = earliest_api
-
-        stats: list[StatisticData] = []
-        zero_filled = 0
-        if walk_start > latest_real_hour:
-            _LOGGER.debug(
-                "Chain tail up to date: DB at %s, latest real API hour %s",
-                walk_start.isoformat(),
-                latest_real_hour.isoformat(),
-            )
-        else:
-            current_hour = walk_start
-            while current_hour <= latest_real_hour:
-                entry = api_entries.get(current_hour)
-                electricity = entry.electricity if entry else None
-                if electricity is None:
-                    # No data yet — hold the cumulative sum flat. The repair
-                    # pass upgrades this hour once real data arrives.
-                    electricity = 0.0
-                    zero_filled += 1
-
-                cumulative += electricity
-                stats.append(
-                    StatisticData(
-                        start=current_hour,
-                        state=_safe_round(cumulative),
-                        sum=_safe_round(cumulative),
-                    )
+        # Serialize the whole read -> repair -> write against any other writer of
+        # this same chain (e.g. an old and a new coordinator across a reload).
+        # See issue #18. The in-memory prelude above stays outside the lock.
+        async with _chain_lock(self.consumption_statistic_id):
+            try:
+                existing = await self._get_existing_statistics_in_window(
+                    self.consumption_statistic_id, earliest_api, window_end
                 )
-                current_hour += timedelta(hours=1)
+            except StatisticsQueryError:
+                # History could not be read. Skip this poll; a later one retries.
+                return
 
-        # missing_rows (< last_db_hour) and stats (>= last_db_hour + 1h) are
-        # disjoint and each ascending, so the concatenation is already ordered.
-        combined = missing_rows + stats
-        if not combined:
-            return
+            # Repair previously zero-filled hours that now have real data. The
+            # repair cascades its positive delta forward through the DB,
+            # including last_db_hour, so anchor the forward walk on the repaired
+            # total to avoid dropping energy at the boundary.
+            repairs = await self._repair_zero_filled_hours(api_entries, existing)
+            repaired_delta = sum(delta for _, delta in repairs)
 
-        await self._import_statistics(combined)
-        _LOGGER.info(
-            "Wrote %d hour(s) for %s (interior_gap=%d, zero_filled=%d)",
-            len(combined),
-            self.consumption_statistic_id,
-            len(missing_rows),
-            zero_filled,
-        )
+            # Flat-fill fully-absent interior hours (gaps strictly between
+            # present rows). These carry post-repair sums (see
+            # _fill_missing_interior_hours) and sit below last_db_hour with zero
+            # delta, so they never touch the anchor; their real data lands on the
+            # next poll's repair pass.
+            missing_rows = self._fill_missing_interior_hours(existing, repairs)
+
+            if existing:
+                last_db_hour = max(existing.keys())
+                cumulative = existing[last_db_hour] + repaired_delta
+                walk_start = last_db_hour + timedelta(hours=1)
+            else:
+                cumulative = 0.0
+                walk_start = earliest_api
+
+            stats: list[StatisticData] = []
+            zero_filled = 0
+            if walk_start > latest_real_hour:
+                _LOGGER.debug(
+                    "Chain tail up to date: DB at %s, latest real API hour %s",
+                    walk_start.isoformat(),
+                    latest_real_hour.isoformat(),
+                )
+            else:
+                current_hour = walk_start
+                while current_hour <= latest_real_hour:
+                    entry = api_entries.get(current_hour)
+                    electricity = entry.electricity if entry else None
+                    if electricity is None:
+                        # No data yet — hold the cumulative sum flat. The repair
+                        # pass upgrades this hour once real data arrives.
+                        electricity = 0.0
+                        zero_filled += 1
+
+                    cumulative += electricity
+                    stats.append(
+                        StatisticData(
+                            start=current_hour,
+                            state=_safe_round(cumulative),
+                            sum=_safe_round(cumulative),
+                        )
+                    )
+                    current_hour += timedelta(hours=1)
+
+            # missing_rows (< last_db_hour) and stats (>= last_db_hour + 1h) are
+            # disjoint and each ascending, so the concatenation is ordered.
+            combined = missing_rows + stats
+            if combined:
+                await self._import_statistics(combined)
+                _LOGGER.info(
+                    "Wrote %d hour(s) for %s (interior_gap=%d, zero_filled=%d)",
+                    len(combined),
+                    self.consumption_statistic_id,
+                    len(missing_rows),
+                    zero_filled,
+                )
+
+            # GUARD #2: a repair enqueues a non-idempotent `sum += adj` on the
+            # recorder thread, but reads run on a separate db_executor pool and
+            # are NOT serialized with that write. Block until the recorder has
+            # applied the queued adjustment before releasing the chain lock, so
+            # the next holder reads post-repair sums and cannot re-detect and
+            # re-apply the same repair (a permanent double-count across a
+            # reload). Only repairs need this; the absolute-sum import is
+            # idempotent under a stale read, so a no-repair poll never flushes.
+            if repairs:
+                await get_instance(self.hass).async_block_till_done()
 
     async def _repair_zero_filled_hours(
         self,
@@ -389,8 +419,9 @@ class HelenConsumptionStatistics:
         start_utc = self._convert_to_utc(
             datetime.combine(start_date, time.min).isoformat()
         ).replace(minute=0, second=0, microsecond=0)
-        now_hour = dt_util.utcnow().replace(minute=0, second=0, microsecond=0)
 
+        # The slow Helen fetch and bucketing stay OUTSIDE the chain lock so they
+        # never hold up a concurrent poll of the same chain.
         series = await self._fetch_range_data(start_date, date.today())
         if not series:
             raise HomeAssistantError(
@@ -405,53 +436,59 @@ class HelenConsumptionStatistics:
             )
             api_elec[hour] = entry.electricity
 
-        # end_time=None so max(in_range) is the TRUE DB tail (GUARD #2): the
-        # rebuild covers every existing hour and is never truncated below it.
-        in_range = await self._get_existing_statistics_in_window(
-            self.consumption_statistic_id, start_utc, None
-        )
-        anchor_sum = await self._get_anchor_sum(start_utc)
+        # Serialize both chain reads and the write against any other writer of
+        # this chain (issue #18). rebuild_range uses only the idempotent
+        # absolute-sum import, so no recorder flush is needed on release.
+        async with _chain_lock(self.consumption_statistic_id):
+            now_hour = dt_util.utcnow().replace(minute=0, second=0, microsecond=0)
 
-        rebuild_end = max(now_hour, max(in_range)) if in_range else now_hour
-
-        rows: list[StatisticData] = []
-        cumulative = anchor_sum  # predecessor sum; the anchor for the first hour
-        current_hour = start_utc
-        while current_hour <= rebuild_end:
-            api_value = api_elec.get(current_hour)
-            if api_value is not None:
-                elec = api_value
-            elif current_hour in in_range:
-                # Preserve rule (GUARD #1): keep this real hour's contribution
-                # measured against the RUNNING predecessor (cumulative), never
-                # an absent in_range[h-1]. A genuine zero-consumption hour gives
-                # delta 0 and harmlessly holds the sum flat.
-                elec = in_range[current_hour] - cumulative
-            else:
-                elec = 0.0
-
-            elec = max(elec, 0.0)  # Helen consumption is non-negative (defensive)
-            cumulative += elec
-            rows.append(
-                StatisticData(
-                    start=current_hour,
-                    state=_safe_round(cumulative),
-                    sum=_safe_round(cumulative),
-                )
+            # end_time=None so max(in_range) is the TRUE DB tail (GUARD #2): the
+            # rebuild covers every existing hour and is never truncated below it.
+            in_range = await self._get_existing_statistics_in_window(
+                self.consumption_statistic_id, start_utc, None
             )
-            current_hour += timedelta(hours=1)
+            anchor_sum = await self._get_anchor_sum(start_utc)
 
-        if not rows:
-            return
+            rebuild_end = max(now_hour, max(in_range)) if in_range else now_hour
 
-        # Single, all-or-nothing write. Nothing was written before this line.
-        await self._import_statistics(rows)
-        _LOGGER.info(
-            "Backfill rebuilt %d hour(s) for %s from %s",
-            len(rows),
-            self.consumption_statistic_id,
-            start_utc.isoformat(),
-        )
+            rows: list[StatisticData] = []
+            cumulative = anchor_sum  # predecessor sum; the anchor for hour one
+            current_hour = start_utc
+            while current_hour <= rebuild_end:
+                api_value = api_elec.get(current_hour)
+                if api_value is not None:
+                    elec = api_value
+                elif current_hour in in_range:
+                    # Preserve rule: keep this real hour's contribution measured
+                    # against the RUNNING predecessor (cumulative), never an
+                    # absent in_range[h-1]. A genuine zero-consumption hour gives
+                    # delta 0 and harmlessly holds the sum flat.
+                    elec = in_range[current_hour] - cumulative
+                else:
+                    elec = 0.0
+
+                elec = max(elec, 0.0)  # Helen consumption is non-negative
+                cumulative += elec
+                rows.append(
+                    StatisticData(
+                        start=current_hour,
+                        state=_safe_round(cumulative),
+                        sum=_safe_round(cumulative),
+                    )
+                )
+                current_hour += timedelta(hours=1)
+
+            if not rows:
+                return
+
+            # Single, all-or-nothing write. Nothing was written before this line.
+            await self._import_statistics(rows)
+            _LOGGER.info(
+                "Backfill rebuilt %d hour(s) for %s from %s",
+                len(rows),
+                self.consumption_statistic_id,
+                start_utc.isoformat(),
+            )
 
     async def _get_anchor_sum(self, start_utc: datetime) -> float:
         """Return the cumulative sum of the last row strictly before start_utc.
