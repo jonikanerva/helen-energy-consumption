@@ -91,8 +91,6 @@ Bootstrap with `mise install` before running anything below. `.mise.toml` (verif
 | `$VERIFY_CMD` | `mise run verify` — ruff check → ruff format --check → mypy → pytest, failing on the first error |
 
 > The ecosystem's structural gates — `hassfest` and HACS validation — cannot run locally in a custom-integration repo (`script.hassfest` lives in the Home Assistant core repository), so they run in CI as the `home-assistant/actions/hassfest` and `hacs/action` GitHub Actions. `$VERIFY_CMD` is what any change must pass before claiming completion; a PR must additionally pass the hassfest and HACS-validate actions.
->
-> **Follow-up to make this fully real:** add `mypy` to the `dev` dependency group with a `[tool.mypy]` strict config in `pyproject.toml`, add the `uv run mypy custom_components` step to `[tasks.verify]` in `.mise.toml`, and add the `.github/workflows/` CI running `$VERIFY_CMD` + hassfest + HACS validation. Until the code is mypy-clean, expect type-tightening fixes.
 
 ---
 
