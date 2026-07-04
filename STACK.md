@@ -34,8 +34,8 @@ VISION.md / CLAUDE.md / STACK.md
 ```
 
 - **Package boundaries (enforced by discipline; add lint rules if they start to blur):**
-  - `statistics.py` and any pure-logic helper compute over **decoded** consumption data, never raw payloads. Helen-API access is confined to `coordinator.py` via the `helenservice` client.
-  - `coordinator.py` is the only owner of the Helen client session and the only place that logs in, selects the delivery site, and drives imports.
+  - `statistics.py` and any pure-logic helper compute over **decoded** consumption data, never raw payloads. Helen client **construction and session ownership** is confined to `coordinator.py`; the fetch helpers in `statistics.py` call Helen only through the client the coordinator hands them and never construct one.
+  - `coordinator.py` is the only owner of the long-lived Helen client session and the only place that drives login, delivery-site selection, and imports on it. `config_flow.py` builds a short-lived client solely for config-flow boundary validation (credential check and delivery-site discovery/selection, as HA's config-flow rules require) and closes it before the entry is created.
   - `__init__.py` wires; it holds no business rules beyond target-entry resolution for the admin action.
   - `const.py` holds constants only — no logic.
 
