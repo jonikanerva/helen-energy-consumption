@@ -169,7 +169,9 @@ class HelenConsumptionStatistics:
 
     async def _fetch_interval_data(self) -> list[MeasurementsWithSpotPriceSeries]:
         """Fetch hourly consumption for the rolling backfill window."""
-        end_date = date.today()
+        end_date = await self.helsinki_today()
+        # ROLLING_WINDOW_HOURS (7 days) plus one day of deliberate slack for
+        # Helen's 1-2 day publication lag (STACK.md §4) — an 8-day fetch, not a bug.
         start_date = end_date - timedelta(days=ROLLING_WINDOW_HOURS // 24 + 1)
 
         # Clamp to contract start so new contracts don't 403 on the pre-contract
@@ -459,7 +461,8 @@ class HelenConsumptionStatistics:
 
         # The slow Helen fetch and bucketing stay OUTSIDE the chain lock so they
         # never hold up a concurrent poll of the same chain.
-        series = await self._fetch_range_data(start_date, date.today())
+        end_date = await self.helsinki_today()
+        series = await self._fetch_range_data(start_date, end_date)
         if not series:
             # The caller asked for a range Helen has no data for: idiomatic
             # service-validation error (cf. the all-unparseable / tz cases,
@@ -604,6 +607,20 @@ class HelenConsumptionStatistics:
         """
         if self._helsinki_tz is None:
             self._helsinki_tz = await dt_util.async_get_time_zone("Europe/Helsinki")
+
+    async def helsinki_today(self) -> date:
+        """Return today's date in Europe/Helsinki — the calendar Helen's API uses.
+
+        Fails closed (like _convert_to_utc) if the zone cannot be resolved, so a
+        broken tzdata install can never silently shift the fetch window by a day.
+        """
+        await self._ensure_helsinki_tz()
+        if self._helsinki_tz is None:
+            raise HomeAssistantError(
+                "Europe/Helsinki time zone unavailable; cannot compute the Helen "
+                "fetch date"
+            )
+        return dt_util.utcnow().astimezone(self._helsinki_tz).date()
 
     def _bucket_series_by_utc_hour(
         self, series: list[MeasurementsWithSpotPriceSeries]
