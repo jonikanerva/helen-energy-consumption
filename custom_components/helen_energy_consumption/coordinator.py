@@ -77,11 +77,10 @@ class HelenConsumptionCoordinator:
         async with self._update_lock:
             try:
                 await self._login_if_needed()
-                if self.delivery_site_id is not None:
-                    await self.hass.async_add_executor_job(
-                        self.api_client.select_delivery_site_if_valid_id,
-                        self.delivery_site_id,
-                    )
+                await self.hass.async_add_executor_job(
+                    self.api_client.select_delivery_site_if_valid_id,
+                    self.delivery_site_id,
+                )
                 await self.statistics.import_recent_statistics()
             except HelenAuthenticationException as err:
                 raise ConfigEntryAuthFailed from err

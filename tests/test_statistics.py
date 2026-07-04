@@ -28,11 +28,11 @@ from helenservice.api_exceptions import InvalidApiResponseException
 from homeassistant.components.recorder.models import StatisticData
 from homeassistant.components.recorder.statistics import statistics_during_period
 from homeassistant.const import UnitOfEnergy
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 
 from custom_components.helen_energy_consumption.const import (
     DOMAIN,
-    STATISTICS_BACKFILL_HOURS,
+    ROLLING_WINDOW_HOURS,
 )
 from custom_components.helen_energy_consumption.statistics import (
     HelenConsumptionStatistics,
@@ -531,7 +531,7 @@ async def test_rebuild_empty_response_writes_nothing() -> None:
 
     with (
         patch(f"{_STATS_MODULE}.dt_util.utcnow", return_value=s0 + timedelta(hours=2)),
-        pytest.raises(HomeAssistantError),
+        pytest.raises(ServiceValidationError),
     ):
         await manager.rebuild_range(start_date)
 
@@ -934,7 +934,7 @@ async def test_fetch_happy_path_uses_correct_positional_signature() -> None:
 
     assert result is series
     expected_end = date.today()
-    expected_start = expected_end - timedelta(days=STATISTICS_BACKFILL_HOURS // 24 + 1)
+    expected_start = expected_end - timedelta(days=ROLLING_WINDOW_HOURS // 24 + 1)
     # Positional arg-order guard: (start: date, end: date, resolution).
     manager.api_client.get_measurements_with_spot_prices.assert_called_once_with(
         expected_start, expected_end, RESOLUTION_HOUR
@@ -1119,9 +1119,11 @@ async def test_rebuild_all_unparseable_raises_and_writes_nothing() -> None:
         return_value=[_raw_entry("bad-1", 1.0), _raw_entry("bad-2", 2.0)]
     )
 
-    with pytest.raises(HomeAssistantError):
+    with pytest.raises(HomeAssistantError) as exc:
         await manager.rebuild_range(date(2026, 1, 15))
 
+    # Systemic failure, NOT the "no data for range" service-validation case.
+    assert not isinstance(exc.value, ServiceValidationError)
     manager._import_statistics.assert_not_called()
 
 
@@ -1166,8 +1168,11 @@ def test_convert_naive_without_tz_raises() -> None:
     manager = _manager()
     manager._helsinki_tz = None
 
-    with pytest.raises(HomeAssistantError):
+    with pytest.raises(HomeAssistantError) as exc:
         manager._convert_to_utc("2026-01-15T10:00:00")
+
+    # Systemic tz failure, NOT a service-validation error.
+    assert not isinstance(exc.value, ServiceValidationError)
 
 
 def test_convert_aware_without_tz_still_converts() -> None:
@@ -1185,8 +1190,11 @@ def test_bucket_does_not_swallow_tz_failure() -> None:
     manager = _manager()
     manager._helsinki_tz = None
 
-    with pytest.raises(HomeAssistantError):
+    with pytest.raises(HomeAssistantError) as exc:
         manager._bucket_series_by_utc_hour([_raw_entry("2026-01-15T10:00:00", 1.0)])
+
+    # Systemic tz failure, NOT a service-validation error.
+    assert not isinstance(exc.value, ServiceValidationError)
 
 
 async def test_repair_ignores_sub_rounding_value() -> None:
