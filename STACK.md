@@ -88,7 +88,7 @@ Bootstrap with `mise install` before running anything below. `.mise.toml` (verif
 | `$LINT_CMD`   | `uv run ruff check custom_components tests && uv run mypy custom_components`                     |
 | `$BUILD_CMD`  | `uv run python -m compileall -q custom_components` (syntax gate — Python has no compile step)    |
 | `$TEST_CMD`   | `uv run pytest tests/`                                                                           |
-| `$VERIFY_CMD` | `mise run verify` — ruff check → ruff format --check → mypy → pytest, failing on the first error |
+| `$VERIFY_CMD` | `mise run verify` — uv sync --frozen → ruff check → ruff format --check → mypy → pytest, failing on the first error |
 
 > The ecosystem's structural gates — `hassfest` and HACS validation — cannot run locally in a custom-integration repo (`script.hassfest` lives in the Home Assistant core repository), so they run in CI as the `home-assistant/actions/hassfest` and `hacs/action` GitHub Actions. `$VERIFY_CMD` is what any change must pass before claiming completion; a PR must additionally pass the hassfest and HACS-validate actions.
 
