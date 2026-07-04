@@ -15,6 +15,7 @@ query so the chain arithmetic is exercised without a live HA database.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from datetime import date, datetime, timedelta
 from types import SimpleNamespace
@@ -1083,3 +1084,136 @@ async def test_import_metadata_mean_type_branch_forward_compat() -> None:
     metadata = add.call_args.args[1]
     assert metadata["mean_type"] == "none_sentinel"
     assert "has_mean" not in metadata
+
+
+# --- robustness hardening (issue #21) ---------------------------------------
+
+
+async def test_bucket_skips_single_unparseable_hour(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Item 1: one bad timestamp is skipped+logged; the good hours still bucket."""
+    manager = _manager()
+    await manager._ensure_helsinki_tz()
+    series = [
+        _raw_entry("2026-01-15T10:00:00+02:00", 1.0),  # 08:00Z
+        _raw_entry("not-a-timestamp", 5.0),  # unparseable -> skipped
+        _raw_entry("2026-01-15T11:00:00+02:00", 3.0),  # 09:00Z
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        buckets = manager._bucket_series_by_utc_hour(series)
+
+    assert buckets == {
+        datetime(2026, 1, 15, 8, 0, tzinfo=_UTC): 1.0,
+        datetime(2026, 1, 15, 9, 0, tzinfo=_UTC): 3.0,
+    }
+    assert "not-a-timestamp" in caplog.text  # bad start logged (no values/PII)
+
+
+async def test_rebuild_all_unparseable_raises_and_writes_nothing() -> None:
+    """Item 1: data returned but no hour parsed -> fail closed, no write."""
+    manager = _manager()
+    manager._import_statistics = AsyncMock()
+    manager._fetch_range_data = AsyncMock(
+        return_value=[_raw_entry("bad-1", 1.0), _raw_entry("bad-2", 2.0)]
+    )
+
+    with pytest.raises(HomeAssistantError):
+        await manager.rebuild_range(date(2026, 1, 15))
+
+    manager._import_statistics.assert_not_called()
+
+
+async def test_poll_all_unparseable_writes_nothing() -> None:
+    """Item 1: an all-unparseable poll response writes nothing (fail-quiet)."""
+    manager = _manager()
+    manager._import_statistics = AsyncMock()
+
+    await manager._write_statistics_chain([_raw_entry("bad-1", 1.0)])
+
+    manager._import_statistics.assert_not_called()
+
+
+async def test_skipped_hour_is_repairable_gap_not_baked_real() -> None:
+    """Item 1: a skipped hour becomes a zero-fill gap, never a baked real value.
+
+    Poll 1: the middle entry has an unparseable timestamp (electricity 5.0). It
+    is skipped, so its slot is a flat zero-fill (== the previous sum), not 5.0.
+    Poll 2: once that hour arrives parseable with real data, the zero-fill is
+    repaired — proving it was never anchored as real.
+    """
+    poll1_manager = _manager()
+    series = [_entry(0, 1.0), _raw_entry("bad-timestamp", 5.0), _entry(2, 1.0)]
+    stats, _ = await _run_poll(poll1_manager, series, existing={})
+
+    rows = {row["start"]: row["sum"] for row in stats}
+    assert rows[_hour(0)] == pytest.approx(1.0)
+    assert rows[_hour(1)] == pytest.approx(1.0)  # flat zero-fill, not 5.0
+    assert rows[_hour(2)] == pytest.approx(2.0)
+
+    # Poll 2: the once-skipped hour now has real data and repairs.
+    poll2_manager = _manager()
+    existing = {_hour(0): 1.0, _hour(1): 1.0, _hour(2): 2.0}
+    _, recorder = await _run_poll(poll2_manager, [_entry(1, 0.5)], existing)
+
+    recorder.async_adjust_statistics.assert_called_once()
+    assert recorder.async_adjust_statistics.call_args.args[1] == _hour(1)
+
+
+def test_convert_naive_without_tz_raises() -> None:
+    """Item 2: a naive timestamp with no resolved tz fails closed (no host tz)."""
+    manager = _manager()
+    manager._helsinki_tz = None
+
+    with pytest.raises(HomeAssistantError):
+        manager._convert_to_utc("2026-01-15T10:00:00")
+
+
+def test_convert_aware_without_tz_still_converts() -> None:
+    """Item 2: an offset-aware timestamp converts even when tz is unresolved."""
+    manager = _manager()
+    manager._helsinki_tz = None
+
+    assert manager._convert_to_utc("2026-01-15T10:00:00+02:00") == datetime(
+        2026, 1, 15, 8, 0, tzinfo=_UTC
+    )
+
+
+def test_bucket_does_not_swallow_tz_failure() -> None:
+    """Item 2: the tz HomeAssistantError propagates through the narrow except."""
+    manager = _manager()
+    manager._helsinki_tz = None
+
+    with pytest.raises(HomeAssistantError):
+        manager._bucket_series_by_utc_hour([_raw_entry("2026-01-15T10:00:00", 1.0)])
+
+
+async def test_repair_ignores_sub_rounding_value() -> None:
+    """Item 3: a value below 3-decimal rounding is not detected as real."""
+    manager = _manager()
+    recorder = MagicMock()
+    existing = {_hour(0): 1.0, _hour(1): 1.0}  # H1 zero-filled (flat)
+    api_elec = {_hour(1): 0.0003}
+
+    with patch(f"{_STATS_MODULE}.get_instance", return_value=recorder):
+        repairs = await manager._repair_zero_filled_hours(api_elec, existing)
+
+    assert repairs == []
+    recorder.async_adjust_statistics.assert_not_called()
+
+
+async def test_repair_applies_real_value() -> None:
+    """Item 3: a real >= 0.001 kWh value still repairs a zero-filled hour."""
+    manager = _manager()
+    recorder = MagicMock()
+    existing = {_hour(0): 1.0, _hour(1): 1.0}
+    api_elec = {_hour(1): 0.5}
+
+    with patch(f"{_STATS_MODULE}.get_instance", return_value=recorder):
+        repairs = await manager._repair_zero_filled_hours(api_elec, existing)
+
+    assert repairs == [(_hour(1), 0.5)]
+    recorder.async_adjust_statistics.assert_called_once_with(
+        manager.consumption_statistic_id, _hour(1), 0.5, "kWh"
+    )
