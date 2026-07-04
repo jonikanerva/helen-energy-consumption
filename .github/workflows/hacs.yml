@@ -19,7 +19,7 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
-          # helen_energy_consumption is not in home-assistant/brands, so the
-          # default brands check fails. Submit-to-brands vs keep-ignoring is
-          # tracked in issue #33 (decide before closing it).
+          # helen_energy_consumption is not in home-assistant/brands; kept
+          # ignored per the decision recorded in issue #33; revisit on HACS
+          # default-store submission.
           ignore: brands
