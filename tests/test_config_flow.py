@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from helenservice.api_exceptions import HelenAuthenticationException
@@ -220,3 +220,113 @@ async def test_duplicate_site_aborts_already_configured(hass: HomeAssistant) -> 
 
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"
+
+
+# --- Seam 4: config-flow reauth (issue #20) ---------------------------------
+
+
+def _reauth_entry() -> MockConfigEntry:
+    """A configured entry with an old password and a delivery site to preserve."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="user_12345",
+        data={
+            CONF_USERNAME: "user",
+            CONF_PASSWORD: "old",
+            CONF_DELIVERY_SITE_ID: "12345",
+        },
+    )
+
+
+async def test_reauth_success_updates_password_preserves_site(
+    hass: HomeAssistant,
+) -> None:
+    """A successful reauth swaps the password, keeps the site, and reloads."""
+    entry = _reauth_entry()
+    entry.add_to_hass(hass)
+    client = MagicMock()  # login_and_init + close succeed
+
+    with (
+        patch(f"{_PKG}.HelenApiClient", return_value=client),
+        patch.object(hass.config_entries, "async_reload", AsyncMock()) as reload,
+    ):
+        result = await entry.start_reauth_flow(hass)
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "reauth_confirm"
+
+        done = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_PASSWORD: "new"}
+        )
+
+    assert done["type"] is FlowResultType.ABORT
+    assert done["reason"] == "reauth_successful"
+    # Password updated AND delivery_site_id preserved.
+    assert entry.data == {
+        CONF_USERNAME: "user",
+        CONF_PASSWORD: "new",
+        CONF_DELIVERY_SITE_ID: "12345",
+    }
+    reload.assert_awaited_once_with(entry.entry_id)
+    # Re-authenticated with the stored username and the NEW password.
+    client.login_and_init.assert_called_once_with("user", "new")
+
+
+async def test_reauth_invalid_auth_keeps_entry_and_closes(hass: HomeAssistant) -> None:
+    """Bad credentials re-show the form, leave the entry unchanged, close session."""
+    entry = _reauth_entry()
+    entry.add_to_hass(hass)
+    client = MagicMock()
+    client.login_and_init.side_effect = HelenAuthenticationException("bad")
+
+    with (
+        patch(f"{_PKG}.HelenApiClient", return_value=client),
+        patch.object(hass.config_entries, "async_reload", AsyncMock()),
+    ):
+        result = await entry.start_reauth_flow(hass)
+        done = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_PASSWORD: "new"}
+        )
+
+    assert done["type"] is FlowResultType.FORM
+    assert done["errors"] == {"base": "invalid_auth"}
+    assert entry.data[CONF_PASSWORD] == "old"  # unchanged
+    client.close.assert_called()  # session cleaned up
+
+
+@pytest.mark.parametrize(
+    "error", [TimeoutError(), ConnectionError(), RuntimeError("boom")]
+)
+async def test_reauth_cannot_connect(hass: HomeAssistant, error: Exception) -> None:
+    """Connection errors (and any generic error) map to cannot_connect, unchanged."""
+    entry = _reauth_entry()
+    entry.add_to_hass(hass)
+    client = MagicMock()
+    client.login_and_init.side_effect = error
+
+    with (
+        patch(f"{_PKG}.HelenApiClient", return_value=client),
+        patch.object(hass.config_entries, "async_reload", AsyncMock()),
+    ):
+        result = await entry.start_reauth_flow(hass)
+        done = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_PASSWORD: "new"}
+        )
+
+    assert done["type"] is FlowResultType.FORM
+    assert done["errors"] == {"base": "cannot_connect"}
+    assert entry.data[CONF_PASSWORD] == "old"
+
+
+async def test_reauth_missing_entry_aborts(hass: HomeAssistant) -> None:
+    """If the entry vanished before confirm, the flow aborts reauth_failed."""
+    entry = _reauth_entry()
+    entry.add_to_hass(hass)
+
+    result = await entry.start_reauth_flow(hass)
+    with patch.object(hass.config_entries, "async_get_entry", return_value=None):
+        done = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_PASSWORD: "new"}
+        )
+
+    assert done["type"] is FlowResultType.ABORT
+    assert done["reason"] == "reauth_failed"
