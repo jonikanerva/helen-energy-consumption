@@ -348,7 +348,11 @@ class HelenConsumptionStatistics:
                 continue  # cumulative moved — hour already has real data
 
             elec = api_elec.get(curr_hour)
-            if elec is None or elec == 0.0:
+            # Round-aware zero check: the library does no rounding and Helen's
+            # precision is unverifiable, so a sub-0.0005 value must not be
+            # re-detected as zero-filled and re-adjusted (double-count). A real
+            # >= 0.001 kWh hour still repairs.
+            if elec is None or _safe_round(elec) == 0.0:
                 continue
 
             recorder.async_adjust_statistics(
@@ -421,6 +425,10 @@ class HelenConsumptionStatistics:
         read or an in-memory computation, so any failure (fetch, empty response,
         recorder read) raises before the write and leaves prior statistics fully
         intact (VISION principle 5). Rows before start_utc are never touched.
+
+        Known limitation: if Helen later revises a past hour while omitting
+        others in the range, a small correction may be attributed to a
+        neighbouring hour; range totals stay monotonic.
         """
         await self._ensure_helsinki_tz()
 
@@ -439,6 +447,14 @@ class HelenConsumptionStatistics:
             )
 
         api_elec = self._bucket_series_by_utc_hour(series)
+        if not api_elec:
+            # Data was returned but no hour parsed — fail closed (write nothing)
+            # rather than treat it as an empty DB and rebuild from zero. (A few
+            # bad hours among good ones proceed; this is the all-bad case.)
+            raise HomeAssistantError(
+                f"Helen returned data but no hour parsed for "
+                f"{self.consumption_statistic_id}"
+            )
 
         # Serialize both chain reads and the write against any other writer of
         # this chain (issue #18). rebuild_range uses only the idempotent
@@ -566,10 +582,37 @@ class HelenConsumptionStatistics:
         Requires _ensure_helsinki_tz() to have run (it uses _convert_to_utc).
         Kept synchronous and called before the #18 chain lock is taken — the
         same pre-read position as the inline builds it replaces.
+
+        A single entry with an unparseable timestamp is skipped and logged
+        rather than aborting the whole window; the hour becomes a gap the repair
+        path fills, and a *persistently* unparseable hour simply stays
+        zero-filled (accepted — the same class as an hour outside the rolling
+        window). A systemic tz failure raises HomeAssistantError from
+        _convert_to_utc and is deliberately NOT caught here (only ValueError /
+        TypeError are), so it propagates fail-closed.
         """
         buckets: dict[datetime, float | None] = {}
+        skipped = 0
         for entry in series:
-            buckets[_floor_hour(self._convert_to_utc(entry.start))] = entry.electricity
+            try:
+                hour = _floor_hour(self._convert_to_utc(entry.start))
+            except (ValueError, TypeError) as err:
+                # Per-hour parse failure only — never the tz HomeAssistantError.
+                skipped += 1
+                _LOGGER.warning(
+                    "Skipping unparseable hour %r for %s: %s",
+                    entry.start,
+                    self.consumption_statistic_id,
+                    err,
+                )
+                continue
+            buckets[hour] = entry.electricity
+        if skipped:
+            _LOGGER.warning(
+                "Skipped %d unparseable hour(s) for %s",
+                skipped,
+                self.consumption_statistic_id,
+            )
         return buckets
 
     def _convert_to_utc(self, timestamp: str) -> datetime:
@@ -580,6 +623,16 @@ class HelenConsumptionStatistics:
         """
         parsed = dt_util.parse_datetime(timestamp, raise_on_error=True)
         if parsed.tzinfo is None:
+            if self._helsinki_tz is None:
+                # Fail closed rather than silently localize via the host tz
+                # (the exact mis-bucketing #12 fixed). HomeAssistantError, not
+                # ValueError/TypeError, so the bucketer's narrow except never
+                # masks this systemic failure.
+                raise HomeAssistantError(
+                    "Europe/Helsinki time zone unavailable; refusing to "
+                    "localize a naive Helen timestamp (would mis-bucket via "
+                    "the host tz)"
+                )
             # Naive input: localize to Helsinki. A DST fall-back duplicated
             # local hour collapses via fold=0 and is unrecoverable without an
             # offset — only relevant if Helen ever emits naive timestamps.

@@ -39,7 +39,7 @@
   "services": {
     "backfill": {
       "name": "Backfill consumption history",
-      "description": "Re-derive hourly electricity consumption from Helen for a delivery site, from a start date through now, rebuilding its statistics chain. Hours Helen has data for are re-derived; hours it does not are preserved from existing data. Data before the start date is left untouched.",
+      "description": "Re-derive hourly electricity consumption from Helen for a delivery site, from a start date through now, rebuilding its statistics chain. Hours Helen has data for are re-derived; hours it does not are preserved from existing data. Data before the start date is left untouched. If Helen later revises a past hour while omitting others in the range, a small correction may be attributed to a neighbouring hour; range totals stay monotonic.",
       "fields": {
         "start_date": {
           "name": "Start date",
