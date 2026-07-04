@@ -28,6 +28,7 @@ dev = [
     "pytest>=8.3,<9",
     "ruff==0.15.20",
     "oma-helen-cli==1.8.0",
+    "mypy>=2.1,<2.2",
 ]
 
 [tool.pytest.ini_options]
@@ -37,6 +38,33 @@ asyncio_default_fixture_loop_scope = "function"
 # Put the repo root on sys.path so `custom_components` imports as a namespace
 # package in tests, the same layout Home Assistant loads at runtime.
 pythonpath = ["."]
+
+[tool.mypy]
+strict = true
+# §1 names these explicitly; strict already implies warn_redundant_casts —
+# kept written-out so the config reads as STACK.md §1 verbatim.
+warn_unreachable = true
+warn_redundant_casts = true
+
+# helenservice (oma-helen-cli) ships no py.typed marker, so strict mode fails
+# every import [import-untyped]. Decision (issue #32): silence at the import
+# boundary; local .pyi stubs rejected (new maintained surface duplicating
+# upstream, contra §2 "push fixes upstream") and follow_untyped_imports
+# rejected by measurement (adds no-untyped-call at our call sites: 25 vs 23
+# errors). Upstream py.typed request: tracked in issue #32 (filing it on the
+# external repo needs the owner's own GitHub action; draft text is on record
+# there).
+[[tool.mypy.overrides]]
+module = "helenservice.*"
+ignore_missing_imports = true
+
+# get_instance is the HA-idiomatic accessor, but recorder/__init__.py
+# re-exports it from .util without __all__, tripping strict's
+# no_implicit_reexport [attr-defined]. Trust the package's re-export rather
+# than deviate from the idiomatic import path.
+[[tool.mypy.overrides]]
+module = "homeassistant.components.recorder"
+implicit_reexport = true
 
 [tool.ruff]
 target-version = "py312"
