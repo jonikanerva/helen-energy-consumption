@@ -22,8 +22,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
+from helenservice import RESOLUTION_HOUR
+from helenservice.api_exceptions import InvalidApiResponseException
+from homeassistant.components.recorder.models import StatisticData
+from homeassistant.components.recorder.statistics import statistics_during_period
+from homeassistant.const import UnitOfEnergy
 from homeassistant.exceptions import HomeAssistantError
 
+from custom_components.helen_energy_consumption.const import (
+    DOMAIN,
+    STATISTICS_BACKFILL_HOURS,
+)
 from custom_components.helen_energy_consumption.statistics import (
     HelenConsumptionStatistics,
     StatisticsQueryError,
@@ -846,3 +855,231 @@ async def test_bucket_aware_and_naive_helsinki_to_utc() -> None:
 
     assert buckets[datetime(2026, 1, 15, 8, 0, tzinfo=_UTC)] == pytest.approx(1.5)
     assert buckets[datetime(2026, 7, 15, 7, 0, tzinfo=_UTC)] == pytest.approx(2.5)
+
+
+# --- Seam 1: live fetch path (issue #20) ------------------------------------
+
+
+def _executor_manager() -> HelenConsumptionStatistics:
+    """Manager whose executor shim runs the submitted callable synchronously."""
+    manager = _manager()
+    manager.hass.async_add_executor_job = AsyncMock(
+        side_effect=lambda func, *args: func(*args)
+    )
+    return manager
+
+
+def _measurements(series: list) -> SimpleNamespace:
+    """Fake MeasurementsWithSpotPriceResponse (only series/missing_series used)."""
+    return SimpleNamespace(series=series, missing_series=[])
+
+
+async def test_fetch_clamps_before_contract_start() -> None:
+    """A contract that starts after the window end yields [] and no fetch call."""
+    manager = _executor_manager()
+    manager.api_client.get_contract_start_date.return_value = date.today() + timedelta(
+        days=1
+    )
+
+    assert await manager._fetch_interval_data() == []
+    manager.api_client.get_measurements_with_spot_prices.assert_not_called()
+
+
+async def test_fetch_maps_no_relevant_contract_to_empty() -> None:
+    """A no-relevant-contract API error maps to [] (outside contract period)."""
+    manager = _executor_manager()
+    manager.api_client.get_contract_start_date.return_value = None
+    manager.api_client.get_measurements_with_spot_prices.side_effect = (
+        InvalidApiResponseException("no-relevant-contract for this gsrn")
+    )
+
+    assert await manager._fetch_interval_data() == []
+
+
+async def test_fetch_reraises_other_api_errors() -> None:
+    """A non-marker API error propagates (not silently swallowed)."""
+    manager = _executor_manager()
+    manager.api_client.get_contract_start_date.return_value = None
+    manager.api_client.get_measurements_with_spot_prices.side_effect = (
+        InvalidApiResponseException("internal-server-error")
+    )
+
+    with pytest.raises(InvalidApiResponseException):
+        await manager._fetch_interval_data()
+
+
+async def test_fetch_swallows_contract_start_error_best_effort() -> None:
+    """A contract-start read error is best-effort: the fetch still proceeds."""
+    manager = _executor_manager()
+    manager.api_client.get_contract_start_date.side_effect = RuntimeError("boom")
+    series = [SimpleNamespace(start="2026-01-15T10:00:00+02:00", electricity=1.0)]
+    manager.api_client.get_measurements_with_spot_prices.return_value = _measurements(
+        series
+    )
+
+    assert await manager._fetch_interval_data() == series
+
+
+async def test_fetch_happy_path_uses_correct_positional_signature() -> None:
+    """The happy path returns the series and calls the API with (start, end, res)."""
+    manager = _executor_manager()
+    manager.api_client.get_contract_start_date.return_value = None
+    series = [SimpleNamespace(start="2026-01-15T10:00:00+02:00", electricity=1.0)]
+    manager.api_client.get_measurements_with_spot_prices.return_value = _measurements(
+        series
+    )
+
+    result = await manager._fetch_interval_data()
+
+    assert result is series
+    expected_end = date.today()
+    expected_start = expected_end - timedelta(days=STATISTICS_BACKFILL_HOURS // 24 + 1)
+    # Positional arg-order guard: (start: date, end: date, resolution).
+    manager.api_client.get_measurements_with_spot_prices.assert_called_once_with(
+        expected_start, expected_end, RESOLUTION_HOUR
+    )
+
+
+# --- Seam 2: DB-read parsing (issue #20) ------------------------------------
+
+
+async def _read_existing(
+    manager: HelenConsumptionStatistics,
+    returned: dict,
+    start: datetime,
+    end: datetime | None = None,
+) -> tuple[dict, MagicMock]:
+    """Run _get_existing_statistics_in_window with a mocked recorder read."""
+    recorder = MagicMock()
+    recorder.async_add_executor_job = AsyncMock(return_value=returned)
+    with patch(f"{_STATS_MODULE}.get_instance", return_value=recorder):
+        result = await manager._get_existing_statistics_in_window(
+            manager.consumption_statistic_id, start, end
+        )
+    return result, recorder
+
+
+async def test_db_read_parses_epoch_float_rows() -> None:
+    """PROD branch on HA 2025.1: rows carry float epoch `start` and a `sum` key.
+
+    Also covers hour-flooring and the stat.get("sum", 0.0) default.
+    """
+    manager = _manager()
+    stat_id = manager.consumption_statistic_id
+
+    def epoch(hour: int, minute: int) -> float:
+        return datetime(2026, 1, 15, hour, minute, tzinfo=_UTC).timestamp()
+
+    rows = [
+        {"start": epoch(10, 0), "sum": 5.0},
+        {"start": epoch(11, 30), "sum": 7.0},  # floored to 11:00
+        {"start": epoch(12, 0)},  # missing sum -> 0.0 default
+    ]
+    result, _ = await _read_existing(
+        manager, {stat_id: rows}, datetime(2026, 1, 15, 0, 0, tzinfo=_UTC)
+    )
+
+    assert result == {
+        datetime(2026, 1, 15, 10, 0, tzinfo=_UTC): 5.0,
+        datetime(2026, 1, 15, 11, 0, tzinfo=_UTC): 7.0,
+        datetime(2026, 1, 15, 12, 0, tzinfo=_UTC): 0.0,
+    }
+
+
+async def test_db_read_parses_datetime_rows_defensively() -> None:
+    """DEFENSIVE/forward-compat: naive-datetime (assume UTC) and aware-datetime.
+
+    These shapes do not occur against real HA 2025.1 (which emits float epochs);
+    they harden the parser against a future recorder change.
+    """
+    manager = _manager()
+    stat_id = manager.consumption_statistic_id
+    helsinki = ZoneInfo("Europe/Helsinki")
+    rows = [
+        {"start": datetime(2026, 1, 15, 8, 30), "sum": 1.0},  # naive -> UTC 08:00
+        {
+            "start": datetime(2026, 1, 15, 9, 15, tzinfo=helsinki),  # +02:00 winter
+            "sum": 2.0,
+        },  # 07:15Z -> floored 07:00Z
+    ]
+    result, _ = await _read_existing(
+        manager, {stat_id: rows}, datetime(2026, 1, 15, 0, 0, tzinfo=_UTC)
+    )
+
+    assert result == {
+        datetime(2026, 1, 15, 8, 0, tzinfo=_UTC): 1.0,
+        datetime(2026, 1, 15, 7, 0, tzinfo=_UTC): 2.0,
+    }
+
+
+async def test_db_read_uses_hour_period_and_sum_type() -> None:
+    """The read passes statistics_during_period with period 'hour', {'sum'}, end."""
+    manager = _manager()
+    _, recorder = await _read_existing(
+        manager, {}, datetime(2026, 1, 15, 0, 0, tzinfo=_UTC), end=None
+    )
+
+    args = recorder.async_add_executor_job.call_args.args
+    assert args[0] is statistics_during_period
+    assert args[3] is None  # end_time=None -> true DB tail
+    assert args[5] == "hour"  # a regression to "day" would break bucketing
+    assert args[7] == {"sum"}
+
+
+async def test_db_read_absent_statistic_id_returns_empty() -> None:
+    """A read with no rows for our statistic_id yields an empty dict."""
+    manager = _manager()
+    result, _ = await _read_existing(
+        manager,
+        {"some_other:statistic": [{"start": 0.0, "sum": 1.0}]},
+        datetime(2026, 1, 15, 0, 0, tzinfo=_UTC),
+    )
+    assert result == {}
+
+
+# --- Seam 3: metadata write (issue #20) -------------------------------------
+
+
+async def test_import_metadata_has_mean_fallback() -> None:
+    """LIVE 2025.1 branch: HAS_MEAN_TYPE False -> has_mean False, no mean_type."""
+    manager = _manager()
+    stats = [StatisticData(start=_hour(0), state=1.0, sum=1.0)]
+
+    with (
+        patch(f"{_STATS_MODULE}.async_add_external_statistics") as add,
+        patch(f"{_STATS_MODULE}.HAS_MEAN_TYPE", False),
+    ):
+        await manager._import_statistics(stats)
+
+    add.assert_called_once()
+    _hass, metadata, passed = add.call_args.args
+    assert metadata["has_sum"] is True
+    assert metadata["source"] == DOMAIN
+    assert metadata["statistic_id"] == manager.consumption_statistic_id
+    assert metadata["unit_of_measurement"] == UnitOfEnergy.KILO_WATT_HOUR
+    assert metadata["unit_class"] == "energy"
+    assert metadata["name"] == f"{manager.name} - Consumption"
+    assert metadata["has_mean"] is False
+    assert "mean_type" not in metadata
+    assert passed is stats
+
+
+async def test_import_metadata_mean_type_branch_forward_compat() -> None:
+    """FORWARD-COMPAT only: StatisticMeanType is absent in pinned HA 2025.1."""
+    manager = _manager()
+    stats = [StatisticData(start=_hour(0), state=1.0, sum=1.0)]
+
+    with (
+        patch(f"{_STATS_MODULE}.async_add_external_statistics") as add,
+        patch(f"{_STATS_MODULE}.HAS_MEAN_TYPE", True),
+        patch(
+            f"{_STATS_MODULE}.StatisticMeanType",
+            SimpleNamespace(NONE="none_sentinel"),
+            create=True,
+        ),
+    ):
+        await manager._import_statistics(stats)
+
+    metadata = add.call_args.args[1]
+    assert metadata["mean_type"] == "none_sentinel"
+    assert "has_mean" not in metadata
