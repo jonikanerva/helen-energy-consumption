@@ -1,0 +1,23 @@
+name: Hassfest
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hassfest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # @master is upstream's only supported ref (its lone tag, 1.0.0, is a
+      # 2020 relic). Floating is the point: hassfest validates against HA's
+      # current dev rules, and the scheduled run exists to catch that drift
+      # before it ambushes a PR. (STACK.md §3)
+      - uses: home-assistant/actions/hassfest@master
