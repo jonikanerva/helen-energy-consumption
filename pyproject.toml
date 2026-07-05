@@ -5,7 +5,7 @@
 
 [project]
 name = "helen-energy-consumption"
-version = "1.0.0"
+version = "1.0.1"
 description = "Helen electricity consumption into Home Assistant statistics."
 requires-python = ">=3.12"
 dependencies = []
