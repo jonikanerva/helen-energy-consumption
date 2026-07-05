@@ -1,5 +1,7 @@
 # Helen Energy Consumption
 
+<img src="https://raw.githubusercontent.com/jonikanerva/helen-energy-consumption/main/assets/icon.png" alt="Helen Energy Consumption" width="128" align="left">
+
 A **minimal** Home Assistant custom component (HACS-compatible) that imports your
 hourly electricity **consumption** from [Oma Helen](https://www.helen.fi/) into
 Home Assistant's statistics database, so it shows up in the **Energy Dashboard**.
