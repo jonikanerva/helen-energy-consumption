@@ -9,5 +9,5 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/jonikanerva/helen-energy-consumption/issues",
   "requirements": ["oma-helen-cli==1.8.0"],
-  "version": "0.1.0"
+  "version": "1.0.0"
 }
