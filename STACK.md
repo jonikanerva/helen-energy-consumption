@@ -25,7 +25,7 @@ custom_components/helen_energy_consumption/
   statistics.py        # HelenConsumptionStatistics — recorder external-statistics import/repair
   diagnostics.py       # redacted config-entry diagnostics (§8 TO_REDACT)
   services.yaml        # backfill admin action schema (UI)
-  translations/en.json
+  translations/*.json  # en, fi
 tests/                 # pytest + pytest-homeassistant-custom-component
 .mise.toml             # pinned tool/runtime versions (Python 3.12, uv) + verify task + uv sync hook
 pyproject.toml         # ruff / mypy / pytest config, dev dependency group
