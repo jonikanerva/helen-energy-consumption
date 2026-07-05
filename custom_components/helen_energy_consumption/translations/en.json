@@ -11,7 +11,7 @@
       },
       "select_site": {
         "title": "Select delivery site",
-        "description": "Your account has more than one delivery site. Choose which one to import; each option shows its meter number (GSRN) and address.",
+        "description": "Your account has more than one delivery site. Choose which one to import; each option shows its metering point ID (GSRN) and address.",
         "data": {
           "delivery_site_id": "Delivery site"
         }

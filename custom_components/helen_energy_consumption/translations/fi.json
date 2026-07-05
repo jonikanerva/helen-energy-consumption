@@ -1,0 +1,55 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Helen Energy Consumption",
+        "description": "Kirjaudu sisään Oma Helen -tunnuksillasi. Vain sähkönkulutus tuodaan.",
+        "data": {
+          "username": "Käyttäjätunnus",
+          "password": "Salasana"
+        }
+      },
+      "select_site": {
+        "title": "Valitse käyttöpaikka",
+        "description": "Tililläsi on useampi kuin yksi käyttöpaikka. Valitse, minkä tiedot tuodaan; jokaisen vaihtoehdon kohdalla näkyy käyttöpaikkatunnus (GSRN) ja osoite.",
+        "data": {
+          "delivery_site_id": "Käyttöpaikka"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Kirjaudu Heleniin uudelleen",
+        "description": "Helen-istuntosi on vanhentunut. Anna salasanasi uudelleen.",
+        "data": {
+          "password": "Salasana"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Virheellinen käyttäjätunnus tai salasana.",
+      "cannot_connect": "Yhteyden muodostaminen Heleniin epäonnistui. Yritä myöhemmin uudelleen.",
+      "invalid_delivery_site_id": "Käyttöpaikkaa ei voitu valita."
+    },
+    "abort": {
+      "already_configured": "Tämä tili on jo määritetty.",
+      "no_delivery_sites": "Tällä Helen-tilillä ei ole sähkön käyttöpaikkaa, jonka kulutusta voisi tuoda.",
+      "reauth_successful": "Uudelleenkirjautuminen onnistui.",
+      "reauth_failed": "Uudelleenkirjautuminen epäonnistui."
+    }
+  },
+  "services": {
+    "backfill": {
+      "name": "Täydennä kulutushistoria",
+      "description": "Laskee tuntikohtaisen sähkönkulutuksen uudelleen Helenistä valitulle käyttöpaikalle aloituspäivästä nykyhetkeen ja rakentaa sen tilastoketjun uudelleen. Tunnit, joille Helenillä on dataa, lasketaan uudelleen; muiden tuntien tiedot säilytetään ennallaan. Aloituspäivää edeltäviä tietoja ei muuteta. Jos Helen myöhemmin korjaa menneen tunnin mutta jättää muita aikavälin tunteja pois, pieni korjaus voi kohdistua viereiseen tuntiin; aikavälin kokonaissummat eivät koskaan pienene.",
+      "fields": {
+        "start_date": {
+          "name": "Aloituspäivä",
+          "description": "Ensimmäinen uudelleen rakennettava päivä, kello 00.00:sta (Suomen aikaa) nykyhetkeen."
+        },
+        "config_entry_id": {
+          "name": "Käyttöpaikka",
+          "description": "Mikä määritetyistä käyttöpaikoista rakennetaan uudelleen. Pakollinen vain, jos käyttöpaikkoja on määritetty useampi kuin yksi."
+        }
+      }
+    }
+  }
+}
